@@ -117,7 +117,7 @@ def sample_control(control_toks, grad, batch_size, topk=256, temp=1, not_allowed
            采样后的控制token候选张量，形状为 [batch_size, 控制序列长度]
        """
     if not_allowed_tokens is not None:
-        grad[:, not_allowed_tokens.to(grad.device)] = np.infty
+        grad[:, not_allowed_tokens.to(grad.device)] = np.inf
 
     topk_result = (-grad).topk(topk, dim=1)
     top_indices = topk_result.indices  # 步骤3：提取TopK值对应的索引
@@ -401,9 +401,8 @@ def load_model_and_tokenizer(model_path, tokenizer_path=None, device='cuda:0', *
     # do_sample=True,  # 可选：是否采样生成
     model = AutoModelForCausalLM.from_pretrained(
             model_path,
-            torch_dtype=torch.float16,
-            output_hidden_states=True,  # 开启所有层隐藏层输出
-            output_attentions=True,  # 可选：同时开启注意力权重输出
+            dtype=torch.float16,
+            #TRANSFORMERS_VERBOSITY=info
             **kwargs
         ).to(device).eval()
     

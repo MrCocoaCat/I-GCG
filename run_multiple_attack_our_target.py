@@ -15,7 +15,7 @@ parser.add_argument('--output_path', type=str,
                     default='ours')
 
 # ===================== 2. 全局配置初始化 =====================
-# 定义可用的GPU设备列表（0-3号卡，共4张GPU）
+
 args = parser.parse_args()
 device_list = [0]
 # 提取防御策略参数（从命令行传入或默认值）
