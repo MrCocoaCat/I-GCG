@@ -148,7 +148,7 @@ def get_logits(*, model, tokenizer, input_ids, control_slice, test_controls=None
         pad_tok = 0
         while pad_tok in input_ids or any([pad_tok in ids for ids in test_ids]):
             pad_tok += 1
-        nested_ids = torch.nested.nested_tensor(test_ids)
+        nested_ids = torch.nested.nested_tensor(test_ids,layout=torch.jagged)
         test_ids = torch.nested.to_padded_tensor(nested_ids, pad_tok,(len(test_ids), max_len))
     else:
         raise ValueError(f"test_controls must be a list of strings, got {type(test_controls)}")
@@ -208,9 +208,7 @@ def target_loss(logits, ids, target_slice):
 
 
 def load_model_and_tokenizer(model_path, tokenizer_path=None, device='cuda:0', **kwargs):
-    model = AutoModelForCausalLM.from_pretrained(model_path,torch_dtype=torch.float16, output_hidden_states=True,    output_attentions=True,
-            **kwargs
-        ).to(device).eval()
+    model = AutoModelForCausalLM.from_pretrained(model_path,torch_dtype=torch.float16,**kwargs).to(device).eval()
     tokenizer_path = model_path if tokenizer_path is None else tokenizer_path
     
     tokenizer = AutoTokenizer.from_pretrained(
