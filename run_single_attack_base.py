@@ -5,7 +5,7 @@ import threading
 # make the timestamp utc-8
 timestamp = (datetime.datetime.now() + datetime.timedelta(hours=8)).strftime("%Y%m%d-%H%M%S")
 BEHAVIOR_ID = 1
-DEVICE = 1
+DEVICE = 0
 OUTPUT_PATH = f"output_base/BEHAVIOR_ID_{BEHAVIOR_ID}/{timestamp}"
 
 def stream_reader(pipe, label):
@@ -33,4 +33,5 @@ def run_single_process(behavior_id: int, device: int, output_path: str,defense:s
     process.communicate()
     
 if __name__ == "__main__":
-    run_single_process(BEHAVIOR_ID, DEVICE, OUTPUT_PATH)
+    #  --device 0 --output_path Our_GCG_target_len_20/ours/20260226-002518 --defense no_defense --behaviors_config behaviors_config.json
+    run_single_process(BEHAVIOR_ID, DEVICE, OUTPUT_PATH,"no_defense","behaviors_config.json")

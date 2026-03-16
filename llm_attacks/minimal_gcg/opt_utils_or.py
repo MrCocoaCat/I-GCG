@@ -1,0 +1,236 @@
+import gc
+import random
+import numpy as np
+import torch
+import torch.nn as nn
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+from llm_attacks import get_embedding_matrix, get_embeddings
+
+
+def token_gradients(model, input_ids, input_slice, target_slice, loss_slice):
+
+    """
+    Computes gradients of the loss with respect to the coordinates.
+    
+    Parameters
+    ----------
+    model : Transformer Model
+        The transformer model to be used.
+    input_ids : torch.Tensor
+        The input sequence in the form of token ids.
+    input_slice : slice
+        The slice of the input sequence for which gradients need to be computed.
+    target_slice : slice
+        The slice of the input sequence to be used as targets.
+    loss_slice : slice
+        The slice of the logits to be used for computing the loss.
+
+    Returns
+    -------
+    torch.Tensor
+        The gradients of each token in the input_slice with respect to the loss.
+    """
+
+    embed_weights = get_embedding_matrix(model)
+    one_hot = torch.zeros(
+        input_ids[input_slice].shape[0],
+        embed_weights.shape[0],
+        device=model.device,
+        dtype=embed_weights.dtype
+    )
+    one_hot.scatter_(
+        1, 
+        input_ids[input_slice].unsqueeze(1),
+        torch.ones(one_hot.shape[0], 1, device=model.device, dtype=embed_weights.dtype)
+    )
+    # # 开启One-Hot张量的梯度追踪（核心：仅对抗Token的嵌入可导）
+    one_hot.requires_grad_()
+    # # 3. 将One-Hot编码转换为Token嵌入向量
+    #     # @ 是矩阵乘法：[对抗长度,词表大小] × [词表大小,嵌入维度] = [对抗长度,嵌入维度]
+    #     # unsqueeze(0) 扩展为[1, 对抗长度, 嵌入维度]，适配模型输入格式
+    input_embeds = (one_hot @ embed_weights).unsqueeze(0)
+    
+    # now stitch it together with the rest of the embeddings
+    # 4. 拼接完整的输入嵌入（固定非对抗区域 + 可导对抗区域）
+    # 先获取完整输入的嵌入（detach()：非对抗区域嵌入固定，不计算梯度）
+    # .detach() 会返回一个新的张量，这个新张量和原张量共享数据（内存相同），但从计算图中脱离—— 简单说，新张量不再参与梯度计算，也不会被 backward() 反向传播影响。
+    embeds = get_embeddings(model, input_ids.unsqueeze(0)).detach()
+    # 拼接逻辑：[对抗前嵌入] + [可导对抗嵌入] + [对抗后嵌入]
+    full_embeds = torch.cat(
+        [
+            embeds[:,:input_slice.start,:], 
+            input_embeds, 
+            embeds[:,input_slice.stop:,:]
+        ], 
+        dim=1)
+    
+    logits = model(inputs_embeds=full_embeds).logits
+    gen_logits = logits[0,loss_slice,:]
+    targets = input_ids[target_slice]
+    # 使用交叉熵计算
+    loss = nn.CrossEntropyLoss()(gen_logits, targets)
+    
+    loss.backward()
+    
+    grad = one_hot.grad.clone()
+    grad = grad / grad.norm(dim=-1, keepdim=True)
+    
+    return grad
+
+def sample_control(control_toks, grad, batch_size, topk=256, temp=1, not_allowed_tokens=None):
+
+    if not_allowed_tokens is not None:
+        grad[:, not_allowed_tokens.to(grad.device)] = np.inf
+
+    top_indices = (-grad).topk(topk, dim=1).indices
+    control_toks = control_toks.to(grad.device)
+
+    original_control_toks = control_toks.repeat(batch_size, 1)
+    new_token_pos = torch.arange(
+        0, 
+        len(control_toks), 
+        len(control_toks) / batch_size,
+        device=grad.device
+    ).type(torch.int64)
+    new_token_val = torch.gather(
+        top_indices[new_token_pos],
+        1,
+        torch.randint(0, topk, (batch_size, 1),device=grad.device)
+    )
+    new_control_toks = original_control_toks.scatter_(1,
+                                                      new_token_pos.unsqueeze(-1),
+                                                      new_token_val)
+
+    return new_control_toks
+
+
+
+def get_filtered_cands(tokenizer, control_cand, filter_cand=True, curr_control=None):
+    cands, count = [], 0
+    for i in range(control_cand.shape[0]):
+        decoded_str = tokenizer.decode(control_cand[i], skip_special_tokens=True)
+        if filter_cand:
+            if decoded_str != curr_control and len(tokenizer(decoded_str, add_special_tokens=False).input_ids) == len(control_cand[i]):
+                cands.append(decoded_str)
+            else:
+                count += 1
+        else:
+            cands.append(decoded_str)
+    if filter_cand:
+        # IGCG 优化
+        if not cands:
+            cands = []
+            for i in range(control_cand.shape[0]):
+                decoded_str = tokenizer.decode(control_cand[i], skip_special_tokens=True)
+                encoded = tokenizer(decoded_str, add_special_tokens=False).input_ids
+                if len(encoded) > len(control_cand[i]):
+                    encoded = encoded[:len(control_cand[i])]
+                else:
+                    encoded = encoded + [random.randrange(1_000, 30_000) for _ in
+                                         range(len(control_cand[i]) - len(encoded))]
+                decoded_str = tokenizer.decode(encoded, skip_special_tokens=True)
+                cands.append(decoded_str)
+        cands = cands + [cands[-1]] * (len(control_cand) - len(cands))
+
+    return cands
+
+
+
+def get_logits(*, model, tokenizer, input_ids, control_slice, test_controls=None, return_ids=False, batch_size=512):
+    
+    if isinstance(test_controls[0], str):
+        max_len = control_slice.stop - control_slice.start
+        test_ids = [
+            torch.tensor(tokenizer(control, add_special_tokens=False).input_ids[:max_len], device=model.device)
+            for control in test_controls
+        ]
+        pad_tok = 0
+        while pad_tok in input_ids or any([pad_tok in ids for ids in test_ids]):
+            pad_tok += 1
+        nested_ids = torch.nested.nested_tensor(test_ids)
+        test_ids = torch.nested.to_padded_tensor(nested_ids, pad_tok,(len(test_ids), max_len))
+    else:
+        raise ValueError(f"test_controls must be a list of strings, got {type(test_controls)}")
+
+    if not(test_ids[0].shape[0] == control_slice.stop - control_slice.start):
+        raise ValueError((
+            f"test_controls must have shape "
+            f"(n, {control_slice.stop - control_slice.start}), " 
+            f"got {test_ids.shape}"
+        ))
+
+    locs = torch.arange(control_slice.start, control_slice.stop).repeat(test_ids.shape[0], 1).to(model.device)
+    ids = torch.scatter(
+        input_ids.unsqueeze(0).repeat(test_ids.shape[0], 1).to(model.device),
+        1,
+        locs,
+        test_ids
+    )
+    if pad_tok >= 0:
+        attn_mask = (ids != pad_tok).type(ids.dtype)
+    else:
+        attn_mask = None
+
+    if return_ids:
+        del locs, test_ids ; gc.collect()
+        return forward(model=model, input_ids=ids, attention_mask=attn_mask, batch_size=batch_size), ids
+    else:
+        del locs, test_ids
+        logits = forward(model=model, input_ids=ids, attention_mask=attn_mask, batch_size=batch_size)
+        del ids ; gc.collect()
+        return logits
+
+def forward(*, model, input_ids, attention_mask, batch_size=512):
+
+    logits = []
+    for i in range(0, input_ids.shape[0], batch_size):
+        
+        batch_input_ids = input_ids[i:i+batch_size]
+        if attention_mask is not None:
+            batch_attention_mask = attention_mask[i:i+batch_size]
+        else:
+            batch_attention_mask = None
+
+        logits.append(model(input_ids=batch_input_ids, attention_mask=batch_attention_mask).logits)
+
+        gc.collect()
+
+    del batch_input_ids, batch_attention_mask
+    
+    return torch.cat(logits, dim=0)
+
+def target_loss(logits, ids, target_slice):
+    crit = nn.CrossEntropyLoss(reduction='none')
+    loss_slice = slice(target_slice.start-1, target_slice.stop-1)
+    loss = crit(logits[:,loss_slice,:].transpose(1,2), ids[:,target_slice])
+    return loss.mean(dim=-1)
+
+
+def load_model_and_tokenizer(model_path, tokenizer_path=None, device='cuda:0', **kwargs):
+    model = AutoModelForCausalLM.from_pretrained(model_path,torch_dtype=torch.float16, output_hidden_states=True,    output_attentions=True,
+            **kwargs
+        ).to(device).eval()
+    tokenizer_path = model_path if tokenizer_path is None else tokenizer_path
+    
+    tokenizer = AutoTokenizer.from_pretrained(
+        tokenizer_path,
+        trust_remote_code=True,
+        use_fast=False
+    )
+    
+    if 'oasst-sft-6-llama-30b' in tokenizer_path:
+        tokenizer.bos_token_id = 1
+        tokenizer.unk_token_id = 0
+    if 'guanaco' in tokenizer_path:
+        tokenizer.eos_token_id = 2
+        tokenizer.unk_token_id = 0
+    if 'llama-2' in tokenizer_path:
+        tokenizer.pad_token = tokenizer.unk_token
+        tokenizer.padding_side = 'left'
+    if 'falcon' in tokenizer_path:
+        tokenizer.padding_side = 'left'
+    if not tokenizer.pad_token:
+        tokenizer.pad_token = tokenizer.eos_token
+    
+    return model, tokenizer

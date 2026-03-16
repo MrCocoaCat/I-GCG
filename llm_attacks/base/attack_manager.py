@@ -284,7 +284,8 @@ class AttackPrompt(object):
             pad_tok = 0
             while pad_tok in self.input_ids or any([pad_tok in ids for ids in test_ids]):
                 pad_tok += 1
-            nested_ids = torch.nested.nested_tensor(test_ids)
+            nested_ids = torch.nested.nested_tensor(test_ids,
+                                                    layout=torch.jagged)
             test_ids = torch.nested.to_padded_tensor(nested_ids, pad_tok, (len(test_ids), max_len))
         else:
             raise ValueError(f"test_controls must be a list of strings or a tensor of token ids, got {type(test_controls)}")
@@ -651,7 +652,7 @@ class MultiPromptAttack(object):
         control_weight=None,
         anneal=True,
         anneal_from=0,
-        prev_loss=np.infty,
+        prev_loss=np.inf,
         stop_on_success=True,
         test_steps=50,
         log_first=False,
