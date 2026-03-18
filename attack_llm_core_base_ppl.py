@@ -181,8 +181,8 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
                 log_dict.append(log_entry)
 
                 # 打印进度
-                print(f"Step {i} | Loss: {current_loss:.4f} | Best Loss: {best_loss:.4f} | Success: {is_success}")
-                print(f"Current Adv: {best_new_adv_suffix[:50]}...")
+                print(f"Step {i} | Loss: {current_loss:.4f} | Best Loss: {best_loss:.4f} | Success: {is_success}|Current Adv: {best_new_adv_suffix[:50]}...")
+
 
         except Exception as e:
             print(f"Error at step {i}: {str(e)}")
