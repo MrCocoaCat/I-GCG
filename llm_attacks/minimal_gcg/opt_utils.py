@@ -502,3 +502,38 @@ def set_seed(seed=42):
     if torch.cuda.is_available():
         torch.cuda.manual_seed(seed)  # 固定GPU上的PyTorch随机
         torch.cuda.manual_seed_all(seed)  # 多GPU场景
+
+
+
+def calculate_text_similarity(model,tokenizer,text1, text2):
+    """
+    计算两个文本的嵌入向量相似度（余弦相似度）
+    Args:
+        text1: 第一个文本字符串
+        text2: 第二个文本字符串
+        tokenizer: 模型对应的tokenizer
+        model: 加载好的模型（需已移至CUDA）
+    Returns:
+        similarity_score: 余弦相似度值（0~1之间，越接近1越相似）
+    """
+    # 处理第一个文本，获取嵌入向量
+    inputs1 = tokenizer(text1, return_tensors="pt", truncation=True, max_length=50, padding=True).to("cuda")
+    with torch.no_grad():
+        token_emb1 = model.model.embed_tokens(inputs1.input_ids)
+        sent_emb1 = torch.mean(token_emb1, dim=1).detach()
+
+    # 处理第二个文本，获取嵌入向量
+    inputs2 = tokenizer(text2, return_tensors="pt", truncation=True, max_length=50, padding=True).to("cuda")
+    with torch.no_grad():
+        token_emb2 = model.model.embed_tokens(inputs2.input_ids)
+        sent_emb2 = torch.mean(token_emb2, dim=1).detach()
+
+    # 直接计算余弦相似度
+    emb1_norm = F.normalize(sent_emb1, p=2, dim=1)
+    emb2_norm = F.normalize(sent_emb2, p=2, dim=1)
+    similarity = torch.matmul(emb1_norm, emb2_norm.T).item()
+
+    # 确保相似度在0~1区间
+    similarity_score = max(0.0, min(1.0, similarity))
+
+    return similarity_score

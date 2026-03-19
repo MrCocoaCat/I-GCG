@@ -22,10 +22,13 @@ sys.path.append(os.path.abspath(repo_root))
 
 from llm_attacks.minimal_gcg.opt_utils import (
     token_gradients, sample_control, get_logits, generate,
-    load_model_and_tokenizer, get_filtered_cands, target_loss, set_seed
+    load_model_and_tokenizer, get_filtered_cands, target_loss, set_seed,calculate_text_similarity
 )
 from llm_attacks.minimal_gcg.string_utils import SuffixManager, load_conversation_template
 from llm_attacks import get_nonascii_toks
+
+
+
 
 # 全局配置
 allow_non_ascii = False  # 禁止非ASCII字符
@@ -88,6 +91,8 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
     # 初始化关键变量
     not_allowed_tokens = None if allow_non_ascii else get_nonascii_toks(tokenizer)
     adv_suffix = adv_string_init
+    # generations = {}
+    # generations[user_prompt] = []
     log_dict = []
 
     # 全局最优统计变量（修复：新增）
@@ -164,6 +169,7 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
                 # 10. 计算PPL（修复：传参错误，仅传3个参数）
                 gen_str_ppl = check_input_ids_ppl(model, tokenizer, input_ids_new)
 
+                text_embedding_similarity= calculate_text_similarity(model, tokenizer,gen_str,suffix_manager.target)
                 # 11. 记录日志
                 log_entry = {
                     "step": i,
@@ -176,7 +182,8 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
                     "adv_suffix": best_new_adv_suffix,
                     "best_adv_suffix": best_adv_suffix,
                     "gen_str": gen_str,
-                    "gen_str_ppl": gen_str_ppl
+                    "gen_str_ppl": gen_str_ppl,
+                    "text_embedding_similarity":text_embedding_similarity
                 }
                 log_dict.append(log_entry)
 
