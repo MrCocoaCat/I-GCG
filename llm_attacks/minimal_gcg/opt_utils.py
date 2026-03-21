@@ -531,9 +531,11 @@ def calculate_text_similarity(model,tokenizer,text1, text2):
     # 直接计算余弦相似度
     emb1_norm = F.normalize(sent_emb1, p=2, dim=1)
     emb2_norm = F.normalize(sent_emb2, p=2, dim=1)
-    similarity = torch.matmul(emb1_norm, emb2_norm.T).item()
+    similarity_raw = torch.matmul(emb1_norm, emb2_norm.T).item()
 
-    # 确保相似度在0~1区间
-    similarity_score = max(0.0, min(1.0, similarity))
+    # 第一步：修正浮点误差导致的超出[-1,1]的异常值（先约束到理论范围）
+    similarity_clamped = max(-1.0, min(1.0, similarity_raw))
+    # 第二步：线性映射到[0,1]区间（保留所有相似度信息）
+    similarity_score = (similarity_clamped + 1.0) / 2.0
 
     return similarity_score
