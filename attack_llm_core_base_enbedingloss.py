@@ -22,7 +22,7 @@ sys.path.append(os.path.abspath(repo_root))
 
 from llm_attacks.minimal_gcg.opt_utils import (
     token_gradients, sample_control, get_logits, generate,
-    load_model_and_tokenizer, get_filtered_cands, target_loss, set_seed,calculate_text_similarity
+    load_model_and_tokenizer, get_filtered_cands, target_loss, set_seed,token_gradients_embeding
 )
 from llm_attacks.minimal_gcg.string_utils import SuffixManager, load_conversation_template
 from llm_attacks import get_nonascii_toks
@@ -113,7 +113,7 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
             input_ids = suffix_manager.get_input_ids(adv_string=adv_suffix).to(device)
 
             # 2. 计算Token梯度
-            coordinate_grad = token_gradients(
+            coordinate_grad = token_gradients_embeding(
                 model, input_ids,
                 suffix_manager._control_slice,  # 对抗后缀切片
                 suffix_manager._target_slice,  # 目标输出切片
@@ -128,40 +128,20 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
                     batch_size=batch_size, topk=topk,
                     not_allowed_tokens=not_allowed_tokens
                 )
-
                 # 4. 解码并过滤候选（保证token长度一致）
                 new_adv_suffix = get_filtered_cands(
                     tokenizer, new_adv_suffix_toks,
                     filter_cand=True, curr_control=adv_suffix
                 )
-                losses_list = []
-                for candidate_suffix in new_adv_suffix:
-                    # 构造候选后缀的输入ID
-                    candidate_input_ids = suffix_manager.get_input_ids(adv_string=candidate_suffix).to(device)
-                    # 生成对应文本
-                    is_success, gen_str = check_for_attack_success(
-                        model, tokenizer, candidate_input_ids,
-                        suffix_manager._assistant_role_slice, test_prefixes
-                    )
-                    # 计算生成文本与目标文本的相似度
-                    similarity = calculate_text_similarity(model, tokenizer, gen_str, suffix_manager.target)
-                    # 转换为损失：相似度越高，损失越小（1 - 相似度）
-                    loss = 1 - similarity
-                    # loss = (1 - similarity) ** 2
-                    losses_list.append(loss)
-                    # 转换为tensor，方便后续argmin操作
-                losses = torch.tensor(losses_list, device=device, dtype=torch.float32)
-                # 5. 计算候选损失，选择最优
-                # logits = get_logits(
-                #     model=model, tokenizer=tokenizer,
-                #     input_ids=input_ids, control_slice=suffix_manager._control_slice,
-                #     test_controls=new_adv_suffix, batch_size=batch_size
-                # )
-                # losses = target_loss(
-                #     logits, input_ids.unsqueeze(0).repeat(len(new_adv_suffix), 1),
-                #     suffix_manager._target_slice
-                # )
-
+                logits = get_logits(
+                    model=model, tokenizer=tokenizer,
+                    input_ids=input_ids, control_slice=suffix_manager._control_slice,
+                    test_controls=new_adv_suffix, batch_size=batch_size
+                )
+                losses = target_loss(
+                    logits, input_ids.unsqueeze(0).repeat(len(new_adv_suffix), 1),
+                    suffix_manager._target_slice
+                )
                 # 6. 更新最优候选
                 best_new_adv_suffix_id = losses.argmin()
                 best_new_adv_suffix = new_adv_suffix[best_new_adv_suffix_id]
@@ -185,11 +165,10 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
                 # 10. 计算PPL（修复：传参错误，仅传3个参数）
                 gen_str_ppl = check_input_ids_ppl(model, tokenizer, input_ids_new)
 
-                text_embedding_similarity= calculate_text_similarity(model, tokenizer,gen_str,suffix_manager.target)
                 # 11. 记录日志
                 log_entry = {
                     "step": i,
-                    "loss": float(current_loss),
+                    "embedding_similarity_loss": float(current_loss),
                     "best_loss": float(best_loss),
                     "is_success": is_success,
                     "batch_size": batch_size,
@@ -199,7 +178,7 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
                     "best_adv_suffix": best_adv_suffix,
                     "gen_str": gen_str,
                     "gen_str_ppl": gen_str_ppl,
-                    "text_embedding_similarity":text_embedding_similarity
+#                    "CrossEntropyLoss":CrossEntropyLoss
                 }
                 log_dict.append(log_entry)
 
@@ -248,7 +227,7 @@ if __name__ == '__main__':
     parser.add_argument('--behaviors_config', type=str, default="behaviors_ours_config.json")
     parser.add_argument('--output_path', type=str,
                         default=f'./output/{(datetime.datetime.now() + datetime.timedelta(hours=8)).strftime("%Y%m%d-%H%M%S")}')
-    parser.add_argument('--batch_size', type=int, default=512)  # 新增：从命令行传参
+    parser.add_argument('--batch_size', type=int, default=6 )  # 新增：从命令行传参
     parser.add_argument('--top_k', type=int, default=256)  # 新增：从命令行传参
     parser.add_argument('--num_steps', type=int, default=1000)  # 新增：从命令行传参
     # 解析参数

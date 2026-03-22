@@ -98,6 +98,104 @@ def token_gradients(model, input_ids, input_slice, target_slice, loss_slice):
     # 返回归一化后的梯度：指导对抗Token的优化方向
     return grad_l2
 
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+def token_gradients_embeding(model, input_ids, input_slice, target_slice, loss_slice):
+    # 前置：确保模型处于训练模式，启用梯度
+    model.train()
+    torch.set_grad_enabled(True)
+
+    # 1. 获取模型词嵌入矩阵（确保dtype一致）
+    embed_weights = get_embedding_matrix(model)
+    if embed_weights is None:
+        raise ValueError("get_embedding_matrix 返回None，请检查实现！")
+    embed_weights = embed_weights.detach()  # 仅作为权重，不计算其梯度
+
+    # 2. 构造对抗Token One-Hot编码（避免叶子张量+原地操作）
+    adv_len = input_ids[input_slice].shape[0]
+    vocab_size = embed_weights.shape[0]
+    # 步骤1：创建基础张量（和嵌入矩阵同dtype）
+    one_hot_base = torch.zeros(
+        adv_len, vocab_size,
+        device=model.device,
+        dtype=embed_weights.dtype  # 统一dtype：Half/float16
+    )
+    # 步骤2：非原地填充One-Hot（用scatter而非scatter_）
+    one_hot_init = one_hot_base.scatter(
+        dim=1,
+        index=input_ids[input_slice].unsqueeze(1),
+        src=torch.ones(adv_len, 1, device=model.device, dtype=embed_weights.dtype)
+    )
+    # 步骤3：转为可导的Parameter（非叶子张量，避免原地操作报错）
+    one_hot = nn.Parameter(one_hot_init, requires_grad=True)
+
+    # 3. 生成对抗Token嵌入（确保dtype一致）
+    input_embeds = (one_hot @ embed_weights).unsqueeze(0)  # [1, adv_len, hidden_dim]
+
+    # 4. 拼接完整输入嵌入（核心修复：移除错误的masked_scatter，用安全的cat）
+    # 步骤1：获取基础嵌入（detach非对抗区域）
+    base_embeds = get_embeddings(model, input_ids.unsqueeze(0)).detach()
+    # 步骤2：按切片拼接（完全非原地操作，无类型错误）
+    full_embeds = torch.cat([
+        base_embeds[:, :input_slice.start, :],  # 对抗区域前的嵌入
+        input_embeds,  # 可导的对抗嵌入
+        base_embeds[:, input_slice.stop:, :]  # 对抗区域后的嵌入
+    ], dim=1)  # dim=1：序列长度维度拼接
+
+    # 5. 模型前向传播（保留梯度）
+    outputs = model(inputs_embeds=full_embeds)
+    logits = outputs.logits  # [1, seq_len, vocab_size]
+
+    # 6. 计算预测文本的句子级嵌入（避免argmax，保留梯度）
+    pred_logits = logits[:, loss_slice, :]  # [1, target_len, vocab_size]
+    pred_probs = F.softmax(pred_logits, dim=-1)  # 可导的概率分布
+    pred_token_emb = torch.matmul(pred_probs, embed_weights)  # [1, target_len, hidden_dim]
+    pred_sent_emb = torch.mean(pred_token_emb, dim=1)  # [1, hidden_dim]
+
+    # 7. 计算目标文本的句子级嵌入（固定目标，detach）
+    target_token_ids = input_ids[target_slice].unsqueeze(0)  # [1, target_len]
+    target_token_emb = model.model.embed_tokens(target_token_ids).detach()
+    target_sent_emb = torch.mean(target_token_emb, dim=1)  # [1, hidden_dim]
+
+    # 8. 计算余弦相似度损失（全张量操作，dtype一致）
+    pred_emb_norm = F.normalize(pred_sent_emb, p=2, dim=1)
+    target_emb_norm = F.normalize(target_sent_emb, p=2, dim=1)
+    # 点积计算相似度（标量张量）
+    similarity_raw = torch.matmul(pred_emb_norm, target_emb_norm.T).squeeze()
+    # 修正浮点误差（统一dtype）
+    clamp_min = torch.tensor(-1.0, device=model.device, dtype=pred_emb_norm.dtype)
+    clamp_max = torch.tensor(1.0, device=model.device, dtype=pred_emb_norm.dtype)
+    similarity_clamped = torch.clamp(similarity_raw, min=clamp_min, max=clamp_max)
+    # 构造损失（越小表示语义越相似）
+    loss = 1 - (similarity_clamped + 1.0) / 2.0
+
+    # 9. 反向传播（安全计算梯度）
+    # 清空梯度（非原地操作）
+    if one_hot.grad is not None:
+        one_hot.grad = torch.zeros_like(one_hot.grad)
+    # 反向传播
+    loss.backward()
+
+    # 10. 梯度校验 + 归一化（避免除0）
+    if one_hot.grad is None:
+        raise RuntimeError(
+            "one_hot梯度为None！请检查：\n"
+            "1. input_slice是否在有效范围内\n"
+            "2. full_embeds是否正确拼接了input_embeds"
+        )
+    one_hot_grad = one_hot.grad.detach().clone()
+    # 防止除0（添加极小值，统一dtype）
+    grad_norm = one_hot_grad.norm(dim=-1, keepdim=True)
+    grad_norm = torch.clamp(grad_norm, min=torch.tensor(1e-8, device=model.device, dtype=one_hot_grad.dtype))
+    grad_l2 = one_hot_grad / grad_norm
+
+    return grad_l2
+
+
 def sample_control(control_toks, grad, batch_size, topk=256, temp=1, not_allowed_tokens=None):
     """
        基于梯度信息采样新的控制token候选集，用于对抗攻击的token替换。
@@ -255,7 +353,6 @@ def get_logits(*, model, tokenizer, input_ids, control_slice, test_controls=None
         attn_mask = (ids != pad_tok).type(ids.dtype)
     else:
         attn_mask = None
-
     if return_ids:
         del locs, test_ids ; gc.collect()
         return forward(model=model, input_ids=ids, attention_mask=attn_mask, batch_size=batch_size), ids
@@ -377,7 +474,6 @@ def target_loss(logits, ids, target_slice):
     loss_slice = slice(target_slice.start-1, target_slice.stop-1)
     loss = crit(logits[:,loss_slice,:].transpose(1,2), ids[:,target_slice])
     return loss.mean(dim=-1)
-
 
 
 
