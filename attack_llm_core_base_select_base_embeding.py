@@ -22,10 +22,45 @@ sys.path.append(os.path.abspath(repo_root))
 
 from llm_attacks.minimal_gcg.opt_utils import (
     token_gradients, sample_control, get_logits, generate,
-    load_model_and_tokenizer, get_filtered_cands, target_loss, set_seed,token_gradients_embeding
+    load_model_and_tokenizer, get_filtered_cands, target_loss, set_seed
 )
 from llm_attacks.minimal_gcg.string_utils import SuffixManager, load_conversation_template
 from llm_attacks import get_nonascii_toks
+
+
+# 核心：适配所有主流LLM的嵌入层获取逻辑
+def get_model_embedding_layer(model):
+    """
+    获取模型的词嵌入层，自动适配不同模型结构
+    Args:
+        model: HuggingFace Transformers模型（LlamaForCausalLM/BertModel/GPT2LMHeadModel等）
+    Returns:
+        word_embedding: 模型的nn.Embedding层
+    """
+    # 处理DataParallel/DistributedDataParallel包装的模型
+    if hasattr(model, 'module'):
+        model = model.module
+
+    # 适配LLaMA/LLaMA2/Mistral（优先级最高，解决你的问题）
+    if hasattr(model, 'model') and hasattr(model.model, 'embed_tokens'):
+        return model.model.embed_tokens
+    # 适配GPT2/GPT-Neo
+    elif hasattr(model, 'transformer') and hasattr(model.transformer, 'wte'):
+        return model.transformer.wte
+    # 适配BERT/RoBERTa/ALBERT
+    elif hasattr(model, 'embeddings') and hasattr(model.embeddings, 'word_embeddings'):
+        return model.embeddings.word_embeddings
+    # 适配T5
+    elif hasattr(model, 'shared'):
+        return model.shared
+    # 适配其他直接暴露embed_tokens的模型
+    elif hasattr(model, 'embed_tokens'):
+        return model.embed_tokens
+    else:
+        # 兜底：打印模型结构，帮助你手动定位
+        print("=== 模型结构预览（前10行）===")
+        print(str(model)[:1000])
+        raise ValueError("未识别的模型结构，请根据上述结构手动指定嵌入层路径！")
 
 
 
@@ -106,7 +141,7 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
             # 1. 构造输入ID（包含对抗后缀）
             input_ids = suffix_manager.get_input_ids(adv_string=adv_suffix).to(device)
             # 2. 计算Token梯度
-            coordinate_grad = token_gradients_embeding(
+            coordinate_grad = token_gradients(
                 model, input_ids,
                 suffix_manager._control_slice,  # 对抗后缀切片
                 suffix_manager._target_slice,  # 目标输出切片
@@ -131,36 +166,100 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
                     input_ids=input_ids, control_slice=suffix_manager._control_slice,
                     test_controls=new_adv_suffix, batch_size=batch_size
                 )
-                ###############后缀选择阶段 ########################
-                cross_entropy_loss = target_loss(
-                    logits, input_ids.unsqueeze(0).repeat(len(new_adv_suffix), 1),
-                    suffix_manager._target_slice
-                )
+                # ========== 后缀选择阶段（完整修正版） ==========
+                # ========== 后缀选择阶段（完整修正版） ==========
+                # 1. 生成目标输入ID（候选批次维度）
+                input_ids_target = input_ids.unsqueeze(0).repeat(len(new_adv_suffix), 1).to(device)  # 确保在指定设备上
 
-                # 6. 更新最优候选,更新候选的时候，选择交叉熵最小的的值
-                best_new_adv_suffix_id = cross_entropy_loss.argmin()
+                # 2. 原交叉熵损失计算（保留用于对比，可按需注释）
+                target_slice = suffix_manager._target_slice
+                crit = nn.CrossEntropyLoss(reduction='none').to(device)  # 损失函数移到对应设备
+                loss_slice = slice(target_slice.start - 1, target_slice.stop - 1)
+                logits_slice = logits[:, loss_slice, :]  # [batch_size, target_seq_len, vocab_size]
+                logits_trans = logits_slice.transpose(1, 2)  # [batch_size, vocab_size, target_seq_len]
+                labels_slice = input_ids_target[:, target_slice]  # [batch_size, target_seq_len]
+                loss = crit(logits_trans, labels_slice)  # [batch_size, target_seq_len]
+                cross_entropy_loss = loss.mean(dim=-1)  # [batch_size]
+                # 原交叉熵选最优（仅用于对比，核心逻辑已替换为相似度）
+                ce_best_id = cross_entropy_loss.argmin()
+                current_cross_entropy_loss = cross_entropy_loss[ce_best_id].detach().cpu().numpy()
+
+                # ========== 修正后的嵌入层获取 ==========
+                word_embedding = get_model_embedding_layer(model)
+                word_embedding = word_embedding.to(device)  # 确保和模型同设备
+
+                # 3.2 生成目标嵌入（聚合target_slice范围内的token）
+                target_token_embeds = word_embedding(
+                    input_ids_target[:, target_slice])  # [batch_size, target_seq_len, embed_dim]
+                target_embed = target_token_embeds.mean(dim=1)  # 聚合为目标单嵌入 [batch_size, embed_dim]
+
+                # 3.3 生成候选后缀嵌入（关键：全张量移到device，解决核心报错）
+                candidate_input_ids = []
+                for suffix in new_adv_suffix:
+                    # 用tokenizer编码候选后缀 + 直接移到device！！！
+                    suffix_ids = tokenizer.encode(
+                        suffix,
+                        add_special_tokens=False,
+                        return_tensors="pt"
+                    ).squeeze(0).to(device)  # 核心修正：生成后立即移到device
+                    candidate_input_ids.append(suffix_ids)
+
+                # 补齐长度（确保所有候选维度一致）
+                max_len = max([len(ids) for ids in candidate_input_ids])
+                candidate_input_ids_padded = []
+                for ids in candidate_input_ids:
+                    pad_len = max_len - len(ids)
+                    # 填充张量也确保在device上（和ids同设备）
+                    pad_tensor = torch.zeros(pad_len, dtype=torch.long).to(device)
+                    # 现在ids和pad_tensor都在同一设备，拼接不会报错
+                    padded_ids = torch.cat([ids, pad_tensor])
+                    candidate_input_ids_padded.append(padded_ids)
+
+                # 转为batch张量 [batch_size, cand_seq_len]（确保在device上）
+                candidate_input_ids = torch.stack(candidate_input_ids_padded).to(device)
+
+                # 3.4 计算候选嵌入并聚合
+                candidate_token_embeds = word_embedding(candidate_input_ids)  # [batch_size, cand_seq_len, embed_dim]
+                # 对候选嵌入聚合（忽略padding的0值，更精准）
+                mask = (candidate_input_ids != 0).unsqueeze(-1).expand(
+                    candidate_token_embeds.size())  # [batch_size, cand_seq_len, embed_dim]
+                sum_embeds = torch.sum(candidate_token_embeds * mask, dim=1)  # 只对非padding部分求和
+                sum_mask = torch.clamp(mask.sum(1), min=1e-9)  # 避免除以0
+                candidate_embeds = sum_embeds / sum_mask  # [batch_size, embed_dim]（带mask的平均）
+
+                # 3.5 计算余弦相似度（归一化+相似度计算）
+                target_embed_norm = F.normalize(target_embed, p=2, dim=-1)
+                candidate_embeds_norm = F.normalize(candidate_embeds, p=2, dim=-1)
+                similarity = F.cosine_similarity(candidate_embeds_norm, target_embed_norm, dim=-1)  # [batch_size]
+
+                # 3.6 选择相似度最大的候选（核心逻辑）
+                best_new_adv_suffix_id = similarity.argmax()
                 best_new_adv_suffix = new_adv_suffix[best_new_adv_suffix_id]
-                current_cross_entropy_loss = cross_entropy_loss[best_new_adv_suffix_id].detach().cpu().numpy()
+                current_similarity = similarity[best_new_adv_suffix_id].detach().cpu().numpy()
 
-                # 7. 更新全局最优（核心：基于loss统计最优adv_str）
-                if current_cross_entropy_loss < best_loss:
-                    best_loss = current_cross_entropy_loss
+                # 4. 更新全局最优（修正逻辑：相似度越大越好）
+                if current_similarity > best_loss:  # 原代码是<，完全错误，改为>
+                    best_loss = current_similarity
                     best_adv_suffix = best_new_adv_suffix
-                # 8. 更新当前对抗后缀
+
+                # 5. 更新当前对抗后缀
                 adv_suffix = best_new_adv_suffix
-                # 9. 测试攻击效果
+
+                # 6. 测试攻击效果（确保input_ids_new在device上）
                 input_ids_new = suffix_manager.get_input_ids(adv_string=adv_suffix).to(device)
                 is_success, gen_str = check_for_attack_success(
                     model, tokenizer, input_ids_new,
                     suffix_manager._assistant_role_slice, test_prefixes
                 )
-                # 10. 计算PPL（修复：传参错误，仅传3个参数）
+
+                # 7. 计算PPL
                 gen_str_ppl = check_input_ids_ppl(model, tokenizer, input_ids_new)
-                # 11. 记录日志
+
+                # 8. 记录日志（补充交叉熵对比信息）
                 log_entry = {
                     "step": i,
-                    "embedding_similarity_loss": float(current_cross_entropy_loss),
-                    "best_loss": float(best_loss),
+                    "current_similarity": float(current_similarity),
+                    "best_similarity": float(best_loss),  # 修正字段名，避免混淆
                     "is_success": is_success,
                     "batch_size": batch_size,
                     "top_k": topk,
@@ -169,11 +268,28 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
                     "best_adv_suffix": best_adv_suffix,
                     "gen_str": gen_str,
                     "gen_str_ppl": gen_str_ppl,
-                    "CrossEntropyLoss":CrossEntropyLoss
+                    "current_cross_entropy_loss": float(current_cross_entropy_loss),
+                    "ce_best_suffix": new_adv_suffix[ce_best_id]
                 }
                 log_dict.append(log_entry)
+                # 11. 记录日志
+                # log_entry = {
+                #     "step": i,
+                #     "current_similarity": float(current_similarity),
+                #     "best_loss": float(best_loss),
+                #     "is_success": is_success,
+                #     "batch_size": batch_size,
+                #     "top_k": topk,
+                #     "user_prompt": suffix_manager.instruction,
+                #     "adv_suffix": best_new_adv_suffix,
+                #     "best_adv_suffix": best_adv_suffix,
+                #     "gen_str": gen_str,
+                #     "gen_str_ppl": gen_str_ppl,
+                #     "current_cross_entropy_loss":current_cross_entropy_loss
+                # }
+                # log_dict.append(log_entry)
                 # 打印进度
-                print(f"Step {i} | Loss: {current_loss:.4f} | Best Loss: {best_loss:.4f} | Success: {is_success}|Current Adv: {best_new_adv_suffix[:50]}...")
+                print(f"Step {i} | Loss: {current_similarity:.4f} | Best Loss: {best_loss:.4f} | Success: {is_success}|Current Adv: {best_new_adv_suffix[:50]}...")
 
 
         except Exception as e:
@@ -182,7 +298,7 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
             continue
 
         # 释放显存
-        del coordinate_grad, adv_suffix_tokens, new_adv_suffix_toks, losses
+        del coordinate_grad, adv_suffix_tokens, new_adv_suffix_toks
         del input_ids, input_ids_new
         gc.collect()
         torch.cuda.empty_cache()
