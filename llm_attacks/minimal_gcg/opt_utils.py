@@ -590,14 +590,6 @@ def generate(model, tokenizer, input_ids, assistant_role_slice, gen_config=None)
     return output_ids[assistant_role_slice.stop:]
 
 
-# 固定所有随机种子（关键！）
-def set_seed(seed=42):
-    random.seed(seed)          # 固定Python原生random
-    np.random.seed(seed)       # 固定numpy随机
-    torch.manual_seed(seed)    # 固定CPU上的PyTorch随机
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(seed)  # 固定GPU上的PyTorch随机
-        torch.cuda.manual_seed_all(seed)  # 多GPU场景
 
 
 
@@ -635,3 +627,5 @@ def calculate_text_similarity(model,tokenizer,text1, text2):
     similarity_score = (similarity_clamped + 1.0) / 2.0
 
     return similarity_score
+
+
