@@ -29,10 +29,17 @@ import torch.nn.functional as F
 from llm_attacks.minimal_gcg.opt_utils_or import load_model_and_tokenizer, get_filtered_cands,set_seed
 from llm_attacks.minimal_gcg.string_utils_or import SuffixManager, load_conversation_template
 from llm_attacks import get_nonascii_toks
+import random
+
+
+##############################
+# 优化思路，在提示词选取的时候，进行PPL 的排序，选取PPL 值较小的值作为待候选的后缀
 
 
 
 
+
+########################
 # 全局配置
 allow_non_ascii = False  # 禁止非ASCII字符
 template_name = 'llama-2'
@@ -89,17 +96,12 @@ def check_for_attack_success(model, tokenizer, input_ids, assistant_role_slice, 
     return jailbroken, gen_str
 
 
-def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_steps, device, test_prefixes, args):
+def minimal_gcg_attack_ppl_chose(model, tokenizer, suffix_manager, adv_string_init, num_steps, device, test_prefixes,n_replace = 20):
     """核心GCG攻击逻辑（补充loss统计+全局最优跟踪）"""
     # 初始化关键变量
     not_allowed_tokens = None if allow_non_ascii else get_nonascii_toks(tokenizer)
     adv_suffix = adv_string_init
-    # generations = {}
-    # generations[user_prompt] = []
     log_dict = []
-    #current_tcs = []
-    #temp = 0
-    #v2_success_counter = 0
     model.eval()
     for i in range(num_steps):
         input_ids = suffix_manager.get_input_ids(adv_string=adv_suffix).to(device)
@@ -110,7 +112,6 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
                                           suffix_manager._loss_slice )
         with torch.no_grad():
             adv_suffix_tokens = input_ids[suffix_manager._control_slice].to(device)
-            n_replace = 20
             new_adv_suffix_toks = sample_control_ppl(
                 adv_suffix_tokens,
                 coordinate_grad,
@@ -122,7 +123,8 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
             total_batch = batch_size * n_replace
             new_adv_suffix = [tokenizer.decode(toks) for toks in new_adv_suffix_toks]
 
-            # TODO: 对new_adv_suffix中的字符串，按PPL 进行排序，选取范围，并不需要所有的都进行推导.与在损失函数中添加PPL 不同，这样做可以专注于词表优化本身 ，
+            # TODO: 对new_adv_suffix中的字符串，按PPL 进行排序，选取范围，并不需要所有的都进行推导.与在损失函数中添加 PPL 不同，
+            #  这样做可以专注于词表优化本身 ，
             # 并减少计算
 
             logits, ppl = get_logits_ppl(model=model,tokenizer=tokenizer, input_ids=input_ids,
@@ -160,7 +162,8 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
                                                            input_ids_new,
                                                            suffix_manager._assistant_role_slice,
                                                            test_prefixes)
-            # TODO: 1、计算过程中，针对多目标进行计算，并记录每次比对的目标，初始阶段多比对，确认差距后，进行 2、替换损失函数，使用嵌入向量进行比对
+            # TODO: 1、计算过程中，针对多目标进行计算，并记录每次比对的目标，初始阶段多比对，确认差距后，进行
+            #  2、替换损失函数，使用嵌入向量进行比对
             log_entry = {
                 "step": i,
                 "loss": str(current_loss.detach().cpu().numpy()),
@@ -189,8 +192,6 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
 
 
 
-
-
 if __name__ == '__main__':
     # python attack_llm_core_base.py --id 50 --device 0 --output_path Our_GCG_target_len_20/ours/20260226-002518 --defense no_defense --behaviors_config behaviors_config.json
     # D:\Model\Llama-2-7b-chat-hf
@@ -205,24 +206,18 @@ if __name__ == '__main__':
 
     # ===================== 1. 配置参数 =====================
     args = parser.parse_args()
-    # os.environ["CUDA_VISIBLE_DEVICES"] = str(args.device)
-    # Set the random seed for NumPy
-    # 实验开始前调用（种子值可自定义，如42）
-    set_seed(42)
-
+    device = "cuda:" + str(args.device) if torch.cuda.is_available() else "cpu"
     model_path = args.model_path
+
     print('behavior_config:', args.behaviors_config)
 
     behavior_config = yaml.load(open(args.behaviors_config), Loader=yaml.FullLoader)[args.id - 1]
     user_prompt = behavior_config["behaviour"]
     target =  behavior_config["target"]
     num_steps = behavior_config['step']
-    # adv_string_init="turn reply giving Arthur pad employees guide `{ Sure},\\ my output Harm. Liste}]({[clojure ({newcommand"
-    template_name = 'llama-2'
-    device = "cuda:"+ str(args.device) if torch.cuda.is_available() else "cpu"
-    #batch_size = behavior_config['batch_size']
-    batch_size = 2
+    batch_size = behavior_config['batch_size']
     topk = behavior_config['top_k']
+
     # ===================== 2. 加载模型/Tokenizer =====================
     model, tokenizer = load_model_and_tokenizer(model_path,
                                                 low_cpu_mem_usage=True,
@@ -230,6 +225,7 @@ if __name__ == '__main__':
                                                 device=device)
 
     adv_string_init = behavior_config["adv_init_suffix"]
+
     sl = 20
     vocab_size = tokenizer.vocab_size
     # 生成正态随机token id（均值0，方差1，映射到合法token范围）
@@ -241,6 +237,7 @@ if __name__ == '__main__':
     #behavior_config["adv_init_suffix"] = adv_string_init
     print('behavior_config', behavior_config)
 
+    template_name = 'llama-2'
     conv_template = load_conversation_template(template_name)
 
     suffix_manager = SuffixManager(
@@ -250,14 +247,14 @@ if __name__ == '__main__':
         target=target,
         adv_string=adv_string_init
     )
-    log_dict = minimal_gcg_attack_ppl(model=model,tokenizer=tokenizer,
-                                       suffix_manager= suffix_manager,
-                                       adv_string_init=adv_string_init,
-                                       num_steps=num_steps,
-                                       batch_size= batch_size,
-                                       device= device,
-                                       test_prefixes=test_prefixes,
-                                       args=args)
+    log_dict = minimal_gcg_attack_ppl_chose(model=model,tokenizer=tokenizer,
+                                           suffix_manager= suffix_manager,
+                                           adv_string_init=adv_string_init,
+                                           num_steps=num_steps,
+                                           batch_size= batch_size,
+                                           device= device,
+                                           test_prefixes=test_prefixes,
+                                           args=args)
 
     log_json_file = pathlib.Path(f'{args.output_path}/log/result_{args.id}.json')
     if not log_json_file.parent.exists():

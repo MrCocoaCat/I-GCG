@@ -28,8 +28,6 @@ from llm_attacks.minimal_gcg.string_utils import SuffixManager, load_conversatio
 from llm_attacks import get_nonascii_toks
 
 
-
-
 # 全局配置
 allow_non_ascii = False  # 禁止非ASCII字符
 template_name = 'llama-2'
@@ -51,25 +49,20 @@ def check_input_ids_ppl(model, tokenizer, input_ids):
     # 修复：确保input_ids是2维张量 [batch_size, seq_len]
     if input_ids.dim() == 1:
         input_ids = input_ids.unsqueeze(0)
-
     prompt_ppl = float('inf')
     with torch.no_grad():
         # 前向传播获取logits
         outputs = model(input_ids=input_ids)
         logits = outputs.logits  # [1, seq_len, vocab_size]
-
-        # 移位操作：logits预测下一个token（PPL计算标准操作）
         shift_logits = logits[:, :-1, :].reshape(-1, logits.size(-1))
         shift_labels = input_ids[:, 1:].reshape(-1)
 
-        # 过滤padding token
         if tokenizer.pad_token_id is not None:
             valid_mask = (shift_labels != tokenizer.pad_token_id)
             if valid_mask.any():
                 shift_logits = shift_logits[valid_mask]
                 shift_labels = shift_labels[valid_mask]
 
-        # 计算交叉熵损失并转换为PPL
         if len(shift_labels) > 0:
             loss = F.cross_entropy(shift_logits, shift_labels, reduction="mean")
             prompt_ppl = torch.exp(loss).item()
@@ -168,8 +161,8 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
 
                 # 10. 计算PPL（修复：传参错误，仅传3个参数）
                 gen_str_ppl = check_input_ids_ppl(model, tokenizer, input_ids_new)
-
                 text_embedding_similarity= calculate_text_similarity(model, tokenizer,gen_str,suffix_manager.target)
+
                 # 11. 记录日志
                 log_entry = {
                     "step": i,
@@ -249,12 +242,6 @@ if __name__ == '__main__':
     target = behavior_config["target"]
     adv_string_init = behavior_config["adv_init_suffix"]
 
-
-    # num_steps = 2
-    #args.batch_size = behavior_config['batch_size']  # 覆盖命令行参数
-    #args.topk = behavior_config['top_k']  # 覆盖命令行参数
-    # args.num_steps = behavior_config["num_steps"]
-    # 设备配置
     device = f"cuda:{args.device}" if torch.cuda.is_available() else "cpu"
     # print('behavior_config:', behavior_config)
     print(f"Using device: {device}, Loading model...")
