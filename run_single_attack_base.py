@@ -40,7 +40,7 @@ def run_single_process(behavior_id: int, device: int, output_path: str,defense:s
 
 
 def run_single_process_select_method_cross_entropy(behavior_id: int, device: int, output_path: str, defense: str, behaviors_config: str):
-    command = ["python", "attack_llm_core_base_select_mothed.py", "--id", str(behavior_id),
+    command = ["python", "-u" ,"attack_llm_core_base_select_mothed.py", "--id", str(behavior_id),
                "--device", str(device),
                "--output_path", output_path,
               # "--defense", defense,
@@ -70,7 +70,7 @@ def run_single_process_select_method_cross_entropy(behavior_id: int, device: int
 
 def run_single_process_select_method_cosine(behavior_id: int, device: int, output_path: str, defense: str, behaviors_config: str):
 
-    command = ["python", "attack_llm_core_base_select_mothed.py", "--id", str(behavior_id),
+    command = ["python", "-u" ,"attack_llm_core_base_select_mothed.py", "--id", str(behavior_id),
                "--device",str(device),
                "--output_path", output_path,
              #  "--defense", defense,

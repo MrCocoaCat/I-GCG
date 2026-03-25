@@ -9,7 +9,7 @@ plt.rcParams['figure.dpi'] = 100
 plt.rcParams['savefig.dpi'] = 300
 
 # 你的JSON文件完整路径
-JSON_FILE_PATH = r"D:\github\I-GCG\Our_GCG_target_len_20\ours\20260320-011719\log\result_32.json"
+JSON_FILE_PATH = r"D:\GitHub\I-GCG\output\20260324-000649\ours\20260324-000649\log\result_32.json"
 
 try:
     # 读取JSON文件

@@ -27,7 +27,6 @@ import os
 os.environ["CUDA_VISIBLE_DEVICES"] = str(args.device)
 
 import gc
-import openai
 import time
 import numpy as np
 import torch
