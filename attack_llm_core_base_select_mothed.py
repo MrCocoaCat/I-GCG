@@ -156,8 +156,8 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
     success_count = 0
     early_stop_threshold = 10
 
-    submission_json_file = pathlib.Path(f'{args.output_path}/submission/result_{args.id}.json')
-    log_json_file = pathlib.Path(f'{args.output_path}/log/result_{args.id}.json')
+    submission_json_file = pathlib.Path(f'{args.output_path}/submission/result_{args.loss_type}_{args.id}.json')
+    log_json_file = pathlib.Path(f'{args.output_path}/log/result_{args.loss_type}_{args.id}.json')
     for f in [submission_json_file, log_json_file]:
         if not f.parent.exists():
             f.parent.mkdir(parents=True)
@@ -256,7 +256,7 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
                     "gen_str": gen_str[:200]                    # 模型输出
                 }
                 log_dict.append(log_entry)
-                print(f"Step {i:3d} | Opt:{args.loss_type:6s} | CE:{current_ce_loss:.4f}({best_ce_loss:.4f}) | Cos:{current_cos_sim:.4f}({best_cos_sim:.4f}) | Success:{is_success}")
+                print(f"id {args.id} | Step {i:3d} | Opt:{args.loss_type:6s} | CE:{current_ce_loss:.4f}({best_ce_loss:.4f}) | Cos:{current_cos_sim:.4f}({best_cos_sim:.4f}) | Success:{is_success}")
 
         except Exception as e:
             print(f"Step {i} err: {str(e)}")
