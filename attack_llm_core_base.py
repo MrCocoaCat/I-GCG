@@ -225,10 +225,10 @@ for i in range(num_steps):
         # Update the running adv_suffix with the best candidate
         adv_suffix = best_new_adv_suffix
         is_success,gen_str = check_for_attack_success(model,
-                                              tokenizer,
-                                              suffix_manager.get_input_ids(adv_string=adv_suffix).to(device),
-                                              suffix_manager._assistant_role_slice,
-                                              test_prefixes)
+                                                      tokenizer,
+                                                      suffix_manager.get_input_ids(adv_string=adv_suffix).to(device),
+                                                      suffix_manager._assistant_role_slice,
+                                                      test_prefixes)
 
         log_entry = {
             "step": i,

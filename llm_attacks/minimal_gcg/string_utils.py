@@ -545,7 +545,7 @@ class SuffixManagerNew:
         return self._control_slice
 
     def target_slice(self):
-        return self._target_slice,  # 目标输出的token切片
+        return self._target_slice  # 目标输出的token切片
 
     def loss_slice(self):
-        return self._loss_slice,
+        return self._loss_slice
