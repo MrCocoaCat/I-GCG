@@ -92,40 +92,24 @@ def check_for_attack_success(model, tokenizer, input_ids, assistant_role_slice, 
     jailbroken = not any([prefix in gen_str for prefix in test_prefixes])
     return jailbroken, gen_str
 
-
-# ===================== 【正确版】余弦相似度：模型输出 vs 目标句子 =====================
-# 全局缓存：只计算一次目标
-TARGET_LOGITS_CACHE = None
-TARGET_TEXT_CACHE = None
-
-# 全局缓存
-TARGET_LOGITS_CACHE = None
-TARGET_TEXT_CACHE = None
-
-# 全局缓存：只计算一次目标句子的 logits
-TARGET_LOGITS_CACHE = None
-
-def compute_both_scores(model, tokenizer, logits, ids, suffix_manager, device,):
-    global TARGET_LOGITS_CACHE
-    #loss_slice = slice(target_slice.start - 1, target_slice.stop - 1)
+# ===================== 修复：余弦相似度计算 =====================
+def compute_both_scores(model, tokenizer, logits, ids, suffix_manager, device):
     target_slice = suffix_manager._target_slice
     # --------------------- 1. 交叉熵（梯度来源，完全不变） ---------------------
     # losses = target_loss(logits, ids, suffix_manager._target_slice)
     crit = nn.CrossEntropyLoss(reduction='none')
-    loss_slice = slice(target_slice.start - 1, target_slice.stop - 1)
-    loss = crit(logits[:, loss_slice, :].transpose(1, 2), ids[:, target_slice])
-    losses =  loss.mean(dim=-1)
-    best_ce_id  = losses.argmin()
-    # best_new_adv_suffix = new_adv_suffix[best_new_adv_suffix_id],这一步在函数外执行
-    current_loss = losses[best_ce_id ].item()
 
-    # --------------------- 2. ✅ 真正目标：数据集里的 target 的 logits ---------------------
-    # 第一次运行：计算目标句子的 logits（只算1次）
-    # target_token = ids[:, target_slice]
-    # print(target_token)
-    # 🔥 关键：获取 Llama 模型的嵌入层
-    embedding_layer = model.get_input_embeddings()
+    start = max(0, target_slice.start - 1)
+    loss_slice = slice(start, target_slice.stop - 1)
+
+    loss = crit(logits[:, loss_slice, :].transpose(1, 2), ids[:, target_slice])
+    losses = loss.mean(dim=-1)
+    best_ce_id = losses.argmin()
+    current_loss = losses[best_ce_id].item()
+
+    embedding_layer = get_model_embedding_layer(model)
     cosine_scores = []
+
     for i in range(ids.shape[0]):
         #print(f"======= BATCH [{i}] =======")
         # --------------------- 1) 真实目标（来自 ids） ---------------------
@@ -133,8 +117,8 @@ def compute_both_scores(model, tokenizer, logits, ids, suffix_manager, device,):
         true_str = tokenizer.decode(true_ids, skip_special_tokens=True)
 
         full_true_str = tokenizer.decode(ids[i], skip_special_tokens=True)
-       # print(f"✅ 模型输入完整句子: {full_true_str}...")
-        true_ids_embedding  =embedding_layer(true_ids)
+        # print(f"✅ 模型输入完整句子: {full_true_str}...")
+        true_ids_embedding = embedding_layer(true_ids)
         # --------------------- 2) 模型预测（来自 logits） ---------------------
         full_pred_logits = logits[i]
         full_pred_ids = full_pred_logits.argmax(dim=-1)
@@ -167,6 +151,21 @@ def compute_both_scores(model, tokenizer, logits, ids, suffix_manager, device,):
     # best_cos_sim    = 最高相似度
     return best_ce_id.item(), current_loss, best_cos_id.item(), best_cos_sim
 
+# ===================== 修复：PPL 筛选函数（必须返回 ids） =====================
+def get_logits_ppl(model, tokenizer, input_ids, control_slice, test_controls, batch_size):
+    logits, ids = get_logits(
+        model=model, tokenizer=tokenizer, input_ids=input_ids,
+        control_slice=control_slice, test_controls=test_controls,
+        return_ids=True, batch_size=batch_size
+    )
+    ppls = []
+    for i in range(ids.shape[0]):
+        ppl = check_input_ids_ppl(model, tokenizer, ids[i:i+1])
+        ppls.append(ppl)
+    ppls = torch.tensor(ppls, device=model.device)
+    return logits, ids, ppls  # ✅ 现在返回 3 个值
+
+# ===================== 修复：主攻击函数（添加 target 参数） =====================
 def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_steps, device, test_prefixes, args):
     not_allowed_tokens = None if allow_non_ascii else get_nonascii_toks(tokenizer)
     adv_suffix = adv_string_init
@@ -181,8 +180,10 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
     success_count = 0
     early_stop_threshold = 10
 
-    submission_json_file = pathlib.Path(f'{args.output_path}/submission/result_{args.loss_type}_{args.id}.json')
-    log_json_file = pathlib.Path(f'{args.output_path}/log/result_{args.loss_type}_{args.id}.json')
+    # 自动加入 ppl 标记
+    ppl_suffix = "_ppl" if args.use_ppl_filter else ""
+    submission_json_file = pathlib.Path(f'{args.output_path}/submission/result_{args.loss_type}{ppl_suffix}_{args.id}.json')
+    log_json_file = pathlib.Path(f'{args.output_path}/log/result_{args.loss_type}{ppl_suffix}_{args.id}.json')
     for f in [submission_json_file, log_json_file]:
         if not f.parent.exists():
             os.makedirs(f.parent, exist_ok=True)
@@ -211,21 +212,15 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
                     filter_cand=True,
                     curr_control=adv_suffix
                 )
-                #
-                # logits ,ids = get_logits(
-                #     model=model, tokenizer=tokenizer,
-                #     input_ids=input_ids, control_slice=suffix_manager._target_slice,
-                #     test_controls=new_adv_suffix, batch_size=batch_size
-                # )
-
                 # Step 3.4 Compute loss on these candidates and take the argmin.
-                logits, ids = get_logits(model= model,
-                                         tokenizer= tokenizer,
-                                         input_ids= input_ids,
-                                         control_slice= suffix_manager._control_slice,
-                                         test_controls= new_adv_suffix,
-                                         return_ids= True,
-                                         batch_size= batch_size)
+                if not args.use_ppl_filter:
+                    logits, ids = get_logits(model=model,
+                                             tokenizer=tokenizer,
+                                             input_ids=input_ids,
+                                             control_slice=suffix_manager._control_slice,
+                                             test_controls=new_adv_suffix,
+                                             return_ids=True,
+                                             batch_size=batch_size)
 
                 # input_ids_target = input_ids.unsqueeze(0).repeat(len(new_adv_suffix), 1).to(device)
                 # target_slice =
@@ -235,6 +230,18 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
                 # current_loss = losses[best_new_adv_suffix_id]
 
                 # ===================== 计算 =====================
+                else:
+                    logits, ids, ppl = get_logits_ppl(
+                        model=model, tokenizer=tokenizer, input_ids=input_ids,
+                        control_slice=suffix_manager._control_slice,
+                        test_controls=new_adv_suffix, batch_size=batch_size
+                    )
+                    sorted_ppl_indices = torch.argsort(ppl)
+                    selected_indices = sorted_ppl_indices[:batch_size]
+                    new_adv_suffix = [new_adv_suffix[i] for i in selected_indices]
+                    logits = logits[selected_indices]
+                    ids = ids[selected_indices]
+
                 best_ce_id, current_ce_loss, best_cos_id, current_cos_sim = compute_both_scores(
                     model=model, tokenizer=tokenizer,
                     logits=logits,  ids = ids,
@@ -275,6 +282,7 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
                 log_entry = {
                     "step": i,
                     "optimize_target": args.loss_type,
+                    "use_ppl_filter": args.use_ppl_filter,  # <--- 已加
                     "current_cross_entropy": current_ce_loss,
                     "current_cosine_sim": current_cos_sim,
                     "best_cross_entropy": best_ce_loss,
@@ -287,18 +295,20 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
                     "target": target# ✅ 目标句子已记录
                 }
                 log_dict.append(log_entry)
+
+                # ===================== 输出显示 PPL 状态 =====================
+                ppl_flag = "PPL=ON" if args.use_ppl_filter else "PPL=OFF"
                 print(
-                    f"id {args.id} | Step {i:2d} | Opt:{args.loss_type:6s} | ppl {ppl:.4f} | "
+                    f"id {args.id} | Step {i:2d} | {ppl_flag} | Opt:{args.loss_type:6s} | ppl {ppl:.4f} | "
                     f"CE:{current_ce_loss:.4f}({best_ce_loss:.4f}) | "
                     f"Cos:{current_cos_sim:.4f}({best_cos_sim:.4f}) | "
                     f"Success:{is_success}"
                 )
         except Exception as e:
             print(f"Step {i} err: {str(e)}")
-            log_dict.append({"step": i, "err": str(e)})
+            log_dict.append({"step": i, "err": str(e), "use_ppl_filter": args.use_ppl_filter})
             continue
 
-        # 显存清理
         del coordinate_grad, adv_suffix_tokens, new_adv_suffix_toks, input_ids, input_ids_new
         gc.collect()
         torch.cuda.empty_cache()
@@ -311,6 +321,7 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
 
     best_result = {
         "optimize_target": args.loss_type,
+        "use_ppl_filter": args.use_ppl_filter,  # <--- 已加
         "best_adv_suffix": best_adv_suffix,
         "best_cross_entropy": best_ce_loss,
         "best_cosine_sim": best_cos_sim,
@@ -335,7 +346,7 @@ if __name__ == '__main__':
     parser.add_argument('--num_steps', type=int, default=500)
     parser.add_argument('--early_stop', type=bool, default=True)
     parser.add_argument('--loss_type', type=str, default="cosine", choices=["cross_entropy", "cosine"])
-
+    parser.add_argument('--use_ppl_filter', action='store_true', default=False)
     args = parser.parse_args()
     set_seed(42)
     device = f"cuda:{args.device}" if torch.cuda.is_available() else "cpu"
@@ -359,7 +370,7 @@ if __name__ == '__main__':
         instruction=user_prompt, target=target, adv_string=adv_string_init
     )
 
-    print(f"\n🚀 启动对比实验 | 优化目标: {args.loss_type}\n")
+    print(f"\n🚀 启动对比实验 | 优化目标: {args.loss_type} | PPL Filter: {args.use_ppl_filter}\n")
     log_dict = minimal_gcg_attack(
         model=model, tokenizer=tokenizer, suffix_manager=suffix_manager,
         adv_string_init=adv_string_init, num_steps=args.num_steps,
