@@ -24,7 +24,7 @@ timestamp = (datetime.datetime.now() + datetime.timedelta(hours=8)).strftime("%Y
 output_path=os.path.join("test_select_method",args.output_path)
 output_path=os.path.join(output_path,str(timestamp))
 
-behaviors_config="behaviors_ours_config_modify.json"
+behaviors_config="output_20260331_revised_init.json"
 # 生成攻击行为ID列表：1-50（对应配置文件中50个有害行为）
 behavior_id_list = [i + 1 for i in range(50)]
 # add id to black_list to skip the id
@@ -80,7 +80,7 @@ def worker_task(task_list, resource_manager):
         print(f"Processing task {task} using card {card.id}")
         # 实际执行的逻辑，其他的代码都是并行处理逻辑
         num_steps = 2
-        batch_size = 1
+        batch_size = 2
         model_path= r"D:\Model\Llama-2-7b-chat-hf"
         # model_path = "/home/liyubo/Model/Llama-2-7b-chat-hf"
 
@@ -90,16 +90,16 @@ def worker_task(task_list, resource_manager):
 
         run_single_process_select_method(behavior_id=task, device=card.id, output_path=output_path,
                                          defense=defense, behaviors_config=behaviors_config, num_steps=num_steps,
-                                         batch_size=batch_size, loss_type="cosine",model_path=model_path)
+                                         batch_size=batch_size, loss_type="cross_entropy",model_path=model_path,use_multi_target = "TRUE")
 
-        run_single_process_select_method(behavior_id=task, device=card.id, output_path=output_path,
-                                         defense=defense, behaviors_config=behaviors_config, num_steps=num_steps,
-                                         batch_size=batch_size, loss_type="cross_entropy", str_init = "adv_init_suffix2",
-                                         model_path=model_path)
-        run_single_process_select_method(behavior_id=task, device=card.id, output_path=output_path,
-                                         defense=defense, behaviors_config=behaviors_config, num_steps=num_steps,
-                                         batch_size=batch_size, loss_type="cross_entropy", str_init="adv_init_suffix2",
-                                         use_ppl_filter="True", model_path=model_path)
+        # run_single_process_select_method(behavior_id=task, device=card.id, output_path=output_path,
+        #                                  defense=defense, behaviors_config=behaviors_config, num_steps=num_steps,
+        #                                  batch_size=batch_size, loss_type="cross_entropy", str_init = "adv_init_suffix2",
+        #                                  model_path=model_path)
+        # run_single_process_select_method(behavior_id=task, device=card.id, output_path=output_path,
+        #                                  defense=defense, behaviors_config=behaviors_config, num_steps=num_steps,
+        #                                  batch_size=batch_size, loss_type="cross_entropy", str_init="adv_init_suffix2",
+        #                                  use_ppl_filter="True", model_path=model_path)
 
         resource_manager.release_card(card)
 

@@ -11,14 +11,7 @@ import torch.nn.functional as F
 import pathlib
 import copy
 import time
-import gc
-import random
-import numpy as np
-import torch
-import torch.nn as nn
-from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from llm_attacks import get_embedding_matrix, get_embeddings
 
 # 修复路径配置逻辑
 repo_root = os.getenv("LLM_ATTACKS_ROOT")
@@ -28,10 +21,16 @@ if not repo_root:
     repo_root = os.path.dirname(experiments_dir)
 sys.path.append(os.path.abspath(repo_root))
 
-from llm_attacks.minimal_gcg.opt_utils import (token_gradients, get_logits, generate, load_model_and_tokenizer,get_filtered_cands,sample_control)
-from llm_attacks.minimal_gcg.string_utils import SuffixManager, load_conversation_template
+from llm_attacks.minimal_gcg.opt_utils import (
+    token_gradients, sample_control, get_logits, generate,
+    load_model_and_tokenizer, get_filtered_cands,get_embedding_matrix,get_embeddings
+)
+from llm_attacks.minimal_gcg.string_utils import SuffixManager, load_conversation_template,SuffixManagerMulTarget
 from llm_attacks import get_nonascii_toks
 from llm_attacks.minimal_gcg.my_opt_utils import set_seed
+
+
+
 
 
 # 核心：适配所有主流LLM的嵌入层获取逻辑
@@ -53,6 +52,87 @@ def get_model_embedding_layer(model):
         print(str(model)[:1000])
         raise ValueError("未识别的模型结构，请手动指定嵌入层路径！")
 
+
+def token_gradients_mul(model, input_ids, input_slice, target_slice, loss_slice,
+                        suffix_manager, tokenizer, device):
+    """
+    多目标梯度计算，返回梯度 + 最优目标信息
+    """
+    embed_weights = get_embedding_matrix(model)
+
+    # 1. 构造 One-Hot 编码
+    one_hot = torch.zeros(
+        input_ids[input_slice].shape[0],
+        embed_weights.shape[0],
+        device=model.device,
+        dtype=embed_weights.dtype
+    )
+    one_hot.scatter_(
+        dim=1,
+        index=input_ids[input_slice].unsqueeze(1),
+        src=torch.ones(one_hot.shape[0], 1, device=model.device, dtype=embed_weights.dtype)
+    )
+    one_hot.requires_grad_()
+
+    # 2. 生成嵌入并前向传播
+    input_embeds = (one_hot @ embed_weights).unsqueeze(0)
+    embeds = get_embeddings(model, input_ids.unsqueeze(0)).detach()
+    full_embeds = torch.cat(
+        [embeds[:, :input_slice.start, :], input_embeds, embeds[:, input_slice.stop:, :]],
+        dim=1
+    )
+    outputs = model(inputs_embeds=full_embeds)
+    logits = outputs.logits
+
+    # 3. 【关键修改】遍历所有目标，记录最优目标的完整信息
+    all_target_texts = [suffix_manager.target] + suffix_manager.target_sim_list
+    min_loss = None
+    best_idx = -1
+    best_target_str = ""
+    best_target_ids = None  # ✅ 保存最优目标的 token ids
+    best_target_slice = None  # ✅ 保存最优目标的 slice
+
+    for idx, target_text in enumerate(all_target_texts):
+        # 编码目标
+        tgt_ids = tokenizer(target_text, return_tensors="pt").input_ids[0].to(device)
+
+        # 使用主目标的 slice 长度（保持长度一致）
+        target_length = target_slice.stop - target_slice.start
+        tgt_ids = tgt_ids[:target_length]
+        pad_len = target_length - len(tgt_ids)
+        if pad_len > 0:
+            pad = torch.full(
+                (pad_len,),
+                tokenizer.pad_token_id,
+                dtype=tgt_ids.dtype,
+                device=tgt_ids.device
+            )
+            tgt_ids = torch.cat([tgt_ids, pad])
+
+        # 计算 loss
+        logit = logits[0, loss_slice, :]
+        current_loss = nn.CrossEntropyLoss()(logit, tgt_ids)
+
+        # 记录最优目标
+        if min_loss is None or current_loss < min_loss:
+            min_loss = current_loss
+            best_idx = idx
+            best_target_str = target_text
+            best_target_ids = tgt_ids  # ✅ 保存
+            best_target_slice = target_slice  # ✅ 保存（或根据实际长度调整）
+
+    # 4. 反向传播
+    loss = min_loss
+    loss.backward()
+    one_hot_grad = one_hot.grad.clone()
+    grad_l2 = one_hot_grad / one_hot_grad.norm(dim=-1, keepdim=True)
+
+    del one_hot, input_embeds, embeds, full_embeds, outputs, logits, loss
+    torch.cuda.empty_cache()
+    gc.collect()
+
+    # ✅ 返回梯度 + 最优目标信息
+    return grad_l2, best_target_str, best_target_ids, best_target_slice, best_idx
 
 # 全局配置
 allow_non_ascii = False
@@ -97,62 +177,60 @@ def check_for_attack_success(model, tokenizer, input_ids, assistant_role_slice, 
     return jailbroken, gen_str
 
 # ===================== 修复：余弦相似度计算 =====================
-def compute_both_scores(model, tokenizer, logits, ids, suffix_manager, device):
-    target_slice = suffix_manager._target_slice
+def compute_both_scores(model, tokenizer, logits, ids, suffix_manager, device,
+                        best_target_ids=None, best_target_slice=None):
+    """
+    计算 CE 和 Cosine 分数，使用梯度选中的最优目标进行筛选
+    """
+
+    # ✅ 统一目标选择逻辑
+    use_external = (best_target_ids is not None and best_target_slice is not None)
+    target_slice = best_target_slice if use_external else suffix_manager._target_slice
+    target_ids = best_target_ids if use_external else ids[0, target_slice]
+
     # --------------------- 1. 交叉熵（梯度来源，完全不变） ---------------------
     # losses = target_loss(logits, ids, suffix_manager._target_slice)
-    crit = nn.CrossEntropyLoss(reduction='none')
 
     start = max(0, target_slice.start - 1)
     loss_slice = slice(start, target_slice.stop - 1)
 
-    loss = crit(logits[:, loss_slice, :].transpose(1, 2), ids[:, target_slice])
+    crit = nn.CrossEntropyLoss(reduction='none')
+    target_expanded = target_ids.unsqueeze(0).expand(logits.shape[0], -1) if use_external else ids[:, target_slice]
+    loss = crit(logits[:, loss_slice, :].transpose(1, 2), target_expanded)
     losses = loss.mean(dim=-1)
     best_ce_id = losses.argmin()
     current_loss = losses[best_ce_id].item()
 
     embedding_layer = get_model_embedding_layer(model)
+    true_ids_embedding = embedding_layer(target_ids)  # ✅ 只获取一次，在循环外
+
+    # ✅ 调试用：解码目标字符串（只解码一次）
+    target_str = tokenizer.decode(target_ids, skip_special_tokens=True)
     cosine_scores = []
 
     for i in range(ids.shape[0]):
-        #print(f"======= BATCH [{i}] =======")
-        # --------------------- 1) 真实目标（来自 ids） ---------------------
-        true_ids = ids[i, target_slice]
-        true_str = tokenizer.decode(true_ids, skip_special_tokens=True)
-
-        full_true_str = tokenizer.decode(ids[i], skip_special_tokens=True)
-        # print(f"✅ 模型输入完整句子: {full_true_str}...")
-        true_ids_embedding = embedding_layer(true_ids)
-        # --------------------- 2) 模型预测（来自 logits） ---------------------
+        # --------------------- 调试输出（保留） ---------------------
         full_pred_logits = logits[i]
         full_pred_ids = full_pred_logits.argmax(dim=-1)
         full_pred_str = tokenizer.decode(full_pred_ids, skip_special_tokens=True)
-       # print(f"🔮 模型【完整】输出: {full_pred_str}")
+        #print(f"✅ 目标句子：{target_str}")
+        #print(f"🔮 候选 {i} 完整输出：{full_pred_str}")
+        # ----------------------------------------------------------
 
         # logits[:, loss_slice, :] 就是模型预测的部分
         pred_logits = logits[i, loss_slice, :]
-        pred_ids = pred_logits.argmax(dim=-1)  # 分数 → token ID（核心步骤）
-        pred_str = tokenizer.decode(pred_ids, skip_special_tokens=True)
+        pred_ids = pred_logits.argmax(dim=-1)
         pred_ids_embedding = embedding_layer(pred_ids)
 
+        # ✅ 使用循环外定义的 true_ids_embedding（不要覆盖！）
         sim = F.cosine_similarity(true_ids_embedding, pred_ids_embedding, dim=-1).mean().item()
         cosine_scores.append(sim)
-
-        # ========== 打印 ==========
-       # print(f"✅ 真实目标: {true_str}")
-       # print(f"🔮 模型预测: {pred_str}")
-       # print(f"📊 余弦相似度: {sim:.4f}\n")
 
         # ========== 选出 相似度最高 的候选 ==========
     cosine_scores = torch.tensor(cosine_scores, device=device)
     best_cos_id = cosine_scores.argmax()
     best_cos_sim = cosine_scores[best_cos_id].item()
 
-    # 你要的返回值：
-    # best_ce_id      = 交叉熵最优（不用）
-    # current_loss    = 交叉熵损失
-    # best_cos_id     = 【你要用的！】相似度最优候选ID
-    # best_cos_sim    = 最高相似度
     return best_ce_id.item(), current_loss, best_cos_id.item(), best_cos_sim
 
 # ===================== 修复：PPL 筛选函数（必须返回 ids） =====================
@@ -168,149 +246,6 @@ def get_logits_ppl(model, tokenizer, input_ids, control_slice, test_controls, ba
         ppls.append(ppl)
     ppls = torch.tensor(ppls, device=model.device)
     return logits, ids, ppls  # ✅ 现在返回 3 个值
-
-
-def token_gradients_mul(model, input_ids, input_slice, target_slice, loss_slice):
-    """
-    Computes gradients of the loss with respect to the coordinates.
-    Parameters
-    ----------
-    model : Transformer Model
-        The transformer model to be used.
-    input_ids : torch.Tensor
-        The input sequence in the form of token ids.
-    input_slice : slice
-        The slice of the input sequence for which gradients need to be computed.
-    target_slice : slice
-        The slice of the input sequence to be used as targets.
-    loss_slice : slice
-        The slice of the logits to be used for computing the loss.
-    Returns
-    -------
-    torch.Tensor
-        The gradients of each token in the input_slice with respect to the loss.
-    """
-    #  1. 获取模型的词嵌入矩阵（shape: [词表大小, 嵌入维度]）
-    #  作用：将Token ID转换为嵌入向量，是梯度计算的基础
-    embed_weights = get_embedding_matrix(model)
-    # 2. 构造对抗切片Token的One-Hot编码（仅对抗Token可导）
-    # shape: [对抗切片长度, 词表大小]，初始全0
-    one_hot = torch.zeros(
-        input_ids[input_slice].shape[0],
-        embed_weights.shape[0],
-        device=model.device,
-        dtype=embed_weights.dtype
-    )
-    # 将当前对抗Token的位置设为1（One-Hot编码核心）
-    one_hot.scatter_(
-        dim=1,
-        index=input_ids[input_slice].unsqueeze(1),
-        src=torch.ones(one_hot.shape[0], 1, device=model.device, dtype=embed_weights.dtype)
-    )
-    # 开启One-Hot张量的梯度追踪（核心：仅对抗Token的嵌入可导）
-    one_hot.requires_grad_()
-    # 3. 将One-Hot编码转换为Token嵌入向量
-    #     @ 是矩阵乘法：[对抗长度,词表大小] × [词表大小,嵌入维度] = [对抗长度,嵌入维度]
-    #     unsqueeze(0) 扩展为[1, 对抗长度, 嵌入维度]，适配模型输入格式
-    input_embeds = (one_hot @ embed_weights).unsqueeze(0)
-
-    # now stitch it together with the rest of the embeddings
-    # 4. 拼接完整的输入嵌入（固定非对抗区域 + 可导对抗区域）
-    # 先获取完整输入的嵌入（detach()：非对抗区域嵌入固定，不计算梯度）
-    # .detach() 会返回一个新的张量，这个新张量和原张量共享数据（内存相同），但从计算图中脱离—— 简单说，新张量不再参与梯度计算，也不会被 backward() 反向传播影响。
-    embeds = get_embeddings(model, input_ids.unsqueeze(0)).detach()
-    # 拼接逻辑：[对抗前嵌入] + [可导对抗嵌入] + [对抗后嵌入]
-    full_embeds = torch.cat(
-        [
-            embeds[:, :input_slice.start, :],
-            input_embeds,
-            embeds[:, input_slice.stop:, :]
-        ],
-        dim=1)
-    # 5. 模型前向传播，获取Logits（未归一化的概率）
-    # inputs_embeds：直接传入嵌入向量，替代input_ids（因为部分嵌入可导）
-    # logits = model(inputs_embeds=full_embeds).logits
-    outputs = model(inputs_embeds=full_embeds)
-    logits = outputs.logits
-    # last_hidden_state：模型最后一层的隐藏层输出（形状同 full_embeds）；
-    # logits（生成类模型）：token 预测概率（形状 [batch_size, seq_len, vocab_size]）；hidden_states（可选）：各层隐藏层输出；attentions（可选）：注意力权重。
-    # 6. 计算交叉熵损失（衡量模型输出与目标内容的差距）
-    # last_hidden_state = outputs.hidden_states[-1]  # 等价于 outputs.last_hidden_state
-    # manual_logits = model.lm_head(last_hidden_state)
-    # print("手动计算logits与outputs.logits是否一致:", torch.allclose(outputs.logits, manual_logits, atol=1e-5))
-    #targets = input_ids[target_slice]
-    #outputs_targets_logits = logits[0, loss_slice, :]
-    #loss = nn.CrossEntropyLoss()(outputs_targets_logits, targets)
-    # 贪心策略：遍历 主目标 + 所有相似目标（每步打印）
-    # ✅ 正确多目标贪心（全打印、全对齐、100% 正确）
-    # ==============================
-    all_target_texts = [suffix_manager.target] + suffix_manager.target_sim_list
-    min_loss = None
-    best_idx = -1
-    for idx, target_text in enumerate(all_target_texts):
-        # 编码目标
-        tgt_ids = suffix_manager.tokenizer(
-            target_text, return_tensors="pt"
-        ).input_ids[0].to(model.device)
-        # 固定使用主目标长度
-        slc = suffix_manager._target_slice
-        loss_slc = suffix_manager._loss_slice
-        target_length = slc.stop - slc.start
-        # 长度对齐（安全版）
-        tgt_ids = tgt_ids[:target_length]
-        pad_len = target_length - len(tgt_ids)
-        if pad_len > 0:
-            pad = torch.full(
-                (pad_len,),
-                suffix_manager.tokenizer.pad_token_id,
-                dtype=tgt_ids.dtype,
-                device=tgt_ids.device
-            )
-            tgt_ids = torch.cat([tgt_ids, pad])
-        # 计算 loss
-        logit = logits[0, loss_slc, :]
-        current_loss = nn.CrossEntropyLoss()(logit, tgt_ids)
-        # --------------------
-        # 🟢 完整打印（你最需要的）
-        # --------------------
-        # if idx == 0:
-        #     tag = "主目标"
-        # else:
-        #     tag = f"相似目标 #{idx - 1}"
-        # print(f"[{tag}]")
-        # print(f"   文本: {target_text}")
-        # print(f"   Loss: {current_loss.item():.4f}")
-        if min_loss is None or current_loss < min_loss:
-            min_loss = current_loss
-            best_idx = idx
-            print(f"   ↳ ✅ 【更新最优】")
-
-    # # 最终结果
-    # if best_idx == 0:
-    #     final_tag = "主目标"
-    #     final_text = suffix_manager.target
-    # else:
-    #     final_tag = f"相似目标 #{best_idx - 1}"
-    #     final_text = all_target_texts[best_idx]
-    #
-    # print("\n✅ 贪心选择完成：")
-    # print(f"   最优目标: {final_tag}")
-    # print(f"   目标文本: {final_text}")
-    # print(f"   最小Loss: {min_loss.item():.4f}")
-    # print("=" * 60 + "\n")
-
-    # 7. 反向传播计算梯度（仅更新one_hot.grad）
-    loss = min_loss
-    loss.backward()
-    # 8. 提取并归一化梯度
-    # L2归一化：梯度除以自身范数，保证不同Token梯度尺度一致，便于后续采样
-    # L2 归一化仅缩放向量长度，不改变元素比例（方向），而求和归一化会彻底改变元素比例
-    # L2 归一化能让不同 Token 的梯度 “长度 = 1”，保证更新步长的公平性，
-    one_hot_grad = one_hot.grad.clone()
-    grad_l2 = one_hot_grad / one_hot_grad.norm(dim=-1, keepdim=True)
-    # 返回归一化后的梯度：指导对抗Token的优化方向
-    return grad_l2
-
 
 # ===================== 修复：主攻击函数（添加 target 参数） =====================
 def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_steps, device, test_prefixes, args):
@@ -329,8 +264,10 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
 
     # 自动加入 ppl 标记
     ppl_suffix = "_ppl" if args.use_ppl_filter else ""
-    submission_json_file = pathlib.Path(f'{args.output_path}/submission/result_{args.loss_type}{ppl_suffix}_{args.str_init}_{args.id}.json')
-    log_json_file = pathlib.Path(f'{args.output_path}/log/result_{args.loss_type}{ppl_suffix}_{args.str_init}_{args.id}.json')
+    mu = "multi_target" if args.use_multi_target else ""
+
+    submission_json_file = pathlib.Path(f'{args.output_path}/submission/result_{mu}{args.loss_type}{ppl_suffix}_{args.str_init}_{args.id}.json')
+    log_json_file = pathlib.Path(f'{args.output_path}/log/result_{mu}{args.loss_type}{ppl_suffix}_{args.str_init}_{args.id}.json')
     for f in [submission_json_file, log_json_file]:
         if not f.parent.exists():
             os.makedirs(f.parent, exist_ok=True)
@@ -338,12 +275,28 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
     for i in range(num_steps):
         try:
             input_ids = suffix_manager.get_input_ids(adv_string=adv_suffix).to(device)
-            coordinate_grad = token_gradients_mul(
-                model, input_ids,
-                suffix_manager._control_slice,
-                suffix_manager._target_slice,
-                suffix_manager._loss_slice
-            )
+            # 自动选择：多目标 / 单目标
+            if args.use_multi_target:
+                # ✅ 修改为接收 5 个值
+                coordinate_grad, best_target_str, best_target_ids, best_target_slice, best_idx = token_gradients_mul(
+                    model, input_ids,
+                    suffix_manager._control_slice,
+                    suffix_manager._target_slice,
+                    suffix_manager._loss_slice,
+                    suffix_manager, tokenizer, device
+                )
+            else:
+                coordinate_grad = token_gradients(
+                    model, input_ids,
+                    suffix_manager._control_slice,
+                    suffix_manager._target_slice,
+                    suffix_manager._loss_slice
+                )
+                best_target_str = suffix_manager.target
+                best_target_ids = None
+                best_target_slice = None # 👈 单目标就用主target
+                best_idx = 0  # 👈 加这行
+
 
             with torch.no_grad():
                 adv_suffix_tokens = input_ids[suffix_manager._control_slice].to(device)
@@ -352,6 +305,7 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
                     batch_size=batch_size, topk=topk,
                     not_allowed_tokens=not_allowed_tokens
                 )
+
                 new_adv_suffix = get_filtered_cands(
                     tokenizer,
                     new_adv_suffix_toks,
@@ -367,6 +321,12 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
                                              test_controls=new_adv_suffix,
                                              return_ids=True,
                                              batch_size=batch_size)
+                    # input_ids_target = input_ids.unsqueeze(0).repeat(len(new_adv_suffix), 1).to(device)
+                    # target_slice =
+                    # losses = target_loss(logits, ids, suffix_manager._target_slice)
+                    # best_new_adv_suffix_id = losses.argmin()
+                    # best_new_adv_suffix = new_adv_suffix[best_new_adv_suffix_id]
+                    # current_loss = losses[best_new_adv_suffix_id]
                 # ===================== 计算 =====================
                 else:
                     # ✅ 正确逻辑：先生成 2倍 候选字符串
@@ -398,7 +358,10 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
                     model=model, tokenizer=tokenizer,
                     logits=logits,  ids = ids,
                     suffix_manager=suffix_manager,
-                    device=device )
+                    device=device,
+                    best_target_ids=best_target_ids,  # ✅ 新增
+                    best_target_slice=best_target_slice  # ✅ 新增
+                )
 
                 # ===================== 选择后缀 =====================
                 if args.loss_type == "cross_entropy":
@@ -444,7 +407,10 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
                     "best_adv_suffix": best_adv_suffix,
                     "current_suffix": best_new_adv_suffix,
                     "gen_str": gen_str[:200],
-                    "target": target   # ✅ 目标句子已记录
+                    "target": suffix_manager.target,
+                    "target_best": best_target_str,
+                    "target_type": "main" if best_idx == 0 else f"similar_{best_idx - 1}",  # ✅ 记录目标类
+                    # ✅ 目标句子已记录
                 }
                 log_dict.append(log_entry)
 
@@ -461,7 +427,10 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
             log_dict.append({"step": i, "err": str(e), "use_ppl_filter": args.use_ppl_filter})
             continue
 
-        del coordinate_grad, adv_suffix_tokens, new_adv_suffix_toks, input_ids, input_ids_new
+        del coordinate_grad, adv_suffix_tokens, new_adv_suffix_toks
+        del input_ids, input_ids_new, logits, ids
+        if 'ppl' in locals():
+            del ppl
         gc.collect()
         torch.cuda.empty_cache()
         if i % 10 == 0:
@@ -485,8 +454,6 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
     return log_dict
 
 
-
-
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="GCG终极对比版：同时记录CE与Cosine最优值")
     parser.add_argument('--model_path', type=str, default=r"D:\Model\Llama-2-7b-chat-hf")
@@ -495,6 +462,7 @@ if __name__ == '__main__':
     parser.add_argument('--behaviors_config', type=str, default="output_20260331_revised_init.json")
     parser.add_argument('--output_path', type=str,
                         default=f'./output/{datetime.datetime.now().strftime("%Y%m%d-%H%M%S")}')
+
     parser.add_argument('--batch_size', type=int, default=6)
     parser.add_argument('--top_k', type=int, default=256)
     parser.add_argument('--num_steps', type=int, default=500)
@@ -502,6 +470,8 @@ if __name__ == '__main__':
     parser.add_argument('--loss_type', type=str, default="cross_entropy", choices=["cross_entropy", "cosine"])
     parser.add_argument('--use_ppl_filter', type=lambda x: x.lower() == 'true', default=False)
     parser.add_argument('--str_init',  type=str, default="adv_init_suffix2")
+    parser.add_argument('--use_multi_target', type=lambda x: x.lower() == 'true', default=True)
+
     args = parser.parse_args()
     set_seed(42)
     device = f"cuda:{args.device}" if torch.cuda.is_available() else "cpu"
@@ -512,19 +482,19 @@ if __name__ == '__main__':
     user_prompt = behavior_config["behaviour"]
     target = behavior_config["target"]
     adv_string_init = behavior_config[args.str_init]
-    target_sim_list = [item["text"] for item in behavior_config["target_similar"]]
+
     # 加载模型
+
     model, tokenizer = load_model_and_tokenizer( args.model_path,
                                                 low_cpu_mem_usage=True,
                                                 use_cache=False,
                                                 device=device)
     conv_template = load_conversation_template(template_name)
-
-    # suffix_manager = SuffixManager(
+    # suffix_manager = SuffixManagerMulTarget(
     #     tokenizer=tokenizer, conv_template=conv_template,
     #     instruction=user_prompt, target=target, adv_string=adv_string_init
     # )
-    # 2. 初始化
+    target_sim_list = [item["text"] for item in behavior_config["target_similar"]]
     suffix_manager = SuffixManagerMulTarget(
         tokenizer=tokenizer,
         conv_template=conv_template,
@@ -534,7 +504,7 @@ if __name__ == '__main__':
         adv_string=adv_string_init
     )
 
-    print(f"\n🚀 启动对比实验 | 优化目标: {args.loss_type} | PPL Filter: {args.use_ppl_filter}| INIT: {adv_string_init}\n")
+    print(f"\n🚀 启动对比实验 | 优化目标: {args.loss_type} | PPL Filter: {args.use_ppl_filter}| INIT: {adv_string_init} | use_multi_target: {args.use_multi_target}\n")
     print(args)
     start = time.time()
     log_dict = minimal_gcg_attack(
@@ -542,6 +512,7 @@ if __name__ == '__main__':
         adv_string_init=adv_string_init, num_steps=args.num_steps,
         device=device, test_prefixes=test_prefixes, args=args
     )
+
     del model, tokenizer
     gc.collect()
     # ✅ 修复：正确计算耗时

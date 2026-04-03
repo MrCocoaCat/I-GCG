@@ -46,7 +46,8 @@ def run_single_process_select_method(behavior_id: int, device: int,
                                      batch_size=512,
                                      loss_type="cross_entropy",
                                      str_init="adv_init_suffix",
-                                     use_ppl_filter = "False"):
+                                     use_ppl_filter = "False",
+                                     use_multi_target = "False"):
     command = ["python", "-u" ,"attack_llm_core_base_select_mothed.py",
                "--id", str(behavior_id),
                "--device", str(device),
@@ -59,7 +60,8 @@ def run_single_process_select_method(behavior_id: int, device: int,
                "--num_steps", str(num_steps),
                "--loss_type", loss_type,
                "--str_init", str_init,
-               "--use_ppl_filter", use_ppl_filter]
+               "--use_ppl_filter", use_ppl_filter,
+               "--use_multi_target", use_multi_target]
 
     process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding='utf-8')
 
