@@ -5,7 +5,7 @@ import datetime
 
 # ===================== 1. 修复版配置 =====================
 parser = argparse.ArgumentParser(description="")
-parser.add_argument('--output_path', type=str, default=r'D:\GitHub\I-GCG\test_select_method\ours\20260403-195405')
+parser.add_argument('--output_path', type=str, default=r'D:\GitHub\I-GCG\test_select_method\ours\20260404-021148')
 
 parser.add_argument('--batch_size', type=int, default=6)
 parser.add_argument('--top_k', type=int, default=256)

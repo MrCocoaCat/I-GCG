@@ -90,7 +90,17 @@ def worker_task(task_list, resource_manager):
 
         run_single_process_select_method(behavior_id=task, device=card.id, output_path=output_path,
                                          defense=defense, behaviors_config=behaviors_config, num_steps=num_steps,
+                                         batch_size=batch_size, loss_type="cross_entropy", model_path=model_path,
+                                         use_contrast_loss="TRUE")
+
+        run_single_process_select_method(behavior_id=task, device=card.id, output_path=output_path,
+                                         defense=defense, behaviors_config=behaviors_config, num_steps=num_steps,
                                          batch_size=batch_size, loss_type="cross_entropy",model_path=model_path,use_multi_target = "TRUE")
+
+        run_single_process_select_method(behavior_id=task, device=card.id, output_path=output_path,
+                                         defense=defense, behaviors_config=behaviors_config, num_steps=num_steps,
+                                         batch_size=batch_size, loss_type="cross_entropy", model_path=model_path,
+                                         use_multi_target="TRUE",use_contrast_loss="TRUE")
 
         # run_single_process_select_method(behavior_id=task, device=card.id, output_path=output_path,
         #                                  defense=defense, behaviors_config=behaviors_config, num_steps=num_steps,

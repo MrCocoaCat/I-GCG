@@ -57,7 +57,7 @@ def token_gradients_mul(model, input_ids, input_slice, target_slice, loss_slice,
                         current_target_ids=None,
                         current_target_index=0,
                         update_counter=0,
-                        stick_steps=8):
+                        stick_steps=8,args=None, test_prefixes=None):
     """
     多目标梯度计算，返回梯度 + 最优目标信息
     """
@@ -133,7 +133,25 @@ def token_gradients_mul(model, input_ids, input_slice, target_slice, loss_slice,
     # 4. 反向传播
     # 你原来的反向传播（只优化当前固定目标）
     logit_slice = logits[0, loss_slice, :]
-    loss = nn.CrossEntropyLoss()(logit_slice, tgt_ids)
+    pos_loss = nn.CrossEntropyLoss()(logit_slice, tgt_ids)
+
+    if not args.use_contrast_loss:
+        loss = pos_loss
+    else:
+        # 负样本：构建【与目标等长的拒绝序列】，保证形状匹配
+        neg_seq = []
+        for s in test_prefixes:
+            neg_seq.extend(tokenizer.encode(s, add_special_tokens=False))
+        # 截断或填充到和目标一样长度（关键修复！）
+        target_len = logit_slice.shape[0]
+        neg_seq = neg_seq[:target_len]
+        if len(neg_seq) < target_len:
+            pad_len = target_len - len(neg_seq)
+            neg_seq.extend([tokenizer.pad_token_id] * pad_len)
+        neg_ids = torch.tensor(neg_seq, device=device)
+
+        neg_loss = F.cross_entropy(logit_slice, neg_ids)
+        loss = pos_loss + args.neg_weight * torch.exp(-neg_loss)
     # loss = min_loss
     loss.backward()
     one_hot_grad = one_hot.grad.clone()
@@ -189,7 +207,7 @@ def check_for_attack_success(model, tokenizer, input_ids, assistant_role_slice, 
 
 # ===================== 修复：余弦相似度计算 =====================
 def compute_both_scores(model, tokenizer, logits, ids, suffix_manager, device,
-                        best_target_ids=None, best_target_slice=None):
+                        best_target_ids=None, best_target_slice=None, args=None):
     """
     计算 CE 和 Cosine 分数，使用梯度选中的最优目标进行筛选
     """
@@ -205,10 +223,12 @@ def compute_both_scores(model, tokenizer, logits, ids, suffix_manager, device,
         #print("🔴 进入【多目标动态筛选】模式：为当前候选选择最优目标")
         #target_ids, target_slice = select_best_target_for_candidate(logits, suffix_manager, tokenizer, device)
         #use_external = True
-        pass
+        target_ids = best_target_ids
+        target_slice = best_target_slice
+        # pass
     else:
         # ============== 单目标：保持原始逻辑 ==============
-        print("🟢 进入【单目标】模式：使用原始目标")
+        # print("🟢 进入【单目标】模式：使用原始目标")
         target_slice = best_target_slice if use_external else suffix_manager._target_slice
         target_ids = best_target_ids if use_external else ids[0, target_slice]
 
@@ -370,10 +390,11 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
     early_stop_threshold = 10
 
     # 自动加入 ppl 标记
-    ppl_suffix = "_ppl" if args.use_ppl_filter else ""
-    mu = "multi_target" if args.use_multi_target else ""
-    submission_json_file = pathlib.Path(f'{args.output_path}/submission/result_{mu}{args.loss_type}{ppl_suffix}_{args.str_init}_{args.id}.json')
-    log_json_file = pathlib.Path(f'{args.output_path}/log/result_{mu}{args.loss_type}{ppl_suffix}_{args.str_init}_{args.id}.json')
+    ppl_suffix = "ppl" if args.use_ppl_filter else ""
+    mu = "multi" if args.use_multi_target else ""
+    con_loss = "contrast" if args.use_contrast_loss else ""
+    submission_json_file = pathlib.Path(f'{args.output_path}/submission/{mu}{args.loss_type}{ppl_suffix}_{args.str_init}_{args.id}.json')
+    log_json_file = pathlib.Path(f'{args.output_path}/log/{mu}_{con_loss}_{args.loss_type}_{ppl_suffix}_{args.str_init}_{args.id}.json')
     for f in [submission_json_file, log_json_file]:
         if not f.parent.exists():
             os.makedirs(f.parent, exist_ok=True)
@@ -391,7 +412,10 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
                     suffix_manager._target_slice,
                     suffix_manager._loss_slice,
                     suffix_manager, tokenizer, device,
-                    **mt_state
+                    *mt_state,
+                    args=args,
+                    test_prefixes=test_prefixes
+
                 )
             else:
                 coordinate_grad = token_gradients(
@@ -466,7 +490,8 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
                     suffix_manager=suffix_manager,
                     device=device,
                     best_target_ids=best_target_ids,  # ✅ 新增
-                    best_target_slice=best_target_slice  # ✅ 新增
+                    best_target_slice=best_target_slice , # ✅ 新增
+                    args = args  # <-- 加这里
                 )
 
                 # ===================== 选择后缀 =====================
@@ -522,8 +547,9 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
 
                 # ===================== 输出显示 PPL 状态 =====================
                 ppl_flag = "PPL=ON" if args.use_ppl_filter else "PPL=OFF"
+                con_flag = "Contrast=ON" if args.use_contrast_loss else "Contrast=OFF"
                 print(
-                    f"id {args.id} | Step {i:2d} | {ppl_flag} | Opt:{args.loss_type:6s} | ppl {ppl:.4f} | "
+                    f"id {args.id} | Step {i:2d} | {ppl_flag} | {con_flag} | Opt:{args.loss_type:6s} | ppl {ppl:.4f} | "
                     f"CE:{current_ce_loss:.4f}({best_ce_loss:.4f}) | "
                     f"Cos:{current_cos_sim:.4f}({best_cos_sim:.4f}) | "
                     f"Success:{is_success}"
