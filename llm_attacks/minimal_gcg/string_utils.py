@@ -205,7 +205,6 @@ class SuffixManager:
         # self._target_slice.stop 是目标输出切片的结束索引（由 get_prompt 计算得出）
         # 截断原因：模型仅需输入到“目标输出开始前”的内容即可预测目标输出，后续 Token 无意义且浪费计算
         input_ids = torch.tensor(toks[:self._target_slice.stop])
-
         return input_ids
 
     def control_slice(self, toks=None):
@@ -228,64 +227,3 @@ class SuffixManager:
 
 
 
-class SuffixManagerMulTarget:
-    def __init__(self, *, tokenizer, conv_template, instruction, target, target_sim_list, adv_string):
-        self.tokenizer = tokenizer
-        self.conv_template = conv_template
-        self.instruction = instruction
-        self.target = target
-        self.target_sim_list = target_sim_list  # 只存文本，足够！
-        self.adv_string = adv_string
-
-    def get_prompt(self, adv_string=None):
-        if adv_string is not None:
-            self.adv_string = adv_string
-        self.conv_template.append_message(self.conv_template.roles[0], f"{self.instruction} {self.adv_string}")
-        self.conv_template.append_message(self.conv_template.roles[1], f"{self.target}")
-        prompt = self.conv_template.get_prompt()
-        encoding = self.tokenizer(prompt)
-        toks = encoding.input_ids
-        if self.conv_template.name == 'llama-2':
-            self.conv_template.messages = []
-            self.conv_template.append_message(self.conv_template.roles[0], None)
-            toks = self.tokenizer(self.conv_template.get_prompt()).input_ids
-            self._user_role_slice = slice(None, 4)
-
-            self.conv_template.update_last_message(f"{self.instruction}")
-            toks = self.tokenizer(self.conv_template.get_prompt()).input_ids
-            self._goal_slice = slice(self._user_role_slice.stop, max(self._user_role_slice.stop, len(toks)-1))
-
-            separator = ' ' if self.instruction else ''
-            self.conv_template.update_last_message(f"{self.instruction}{separator}{self.adv_string}")
-            toks = self.tokenizer(self.conv_template.get_prompt()).input_ids
-            self._control_slice = slice(self._goal_slice.stop, len(toks)-1)
-
-            self.conv_template.append_message(self.conv_template.roles[1], None)
-            toks = self.tokenizer(self.conv_template.get_prompt()).input_ids
-            self._assistant_role_slice = slice(self._control_slice.stop, len(toks))
-
-            self.conv_template.update_last_message(f"{self.target}")
-            toks = self.tokenizer(self.conv_template.get_prompt()).input_ids
-            self._target_slice = slice(self._assistant_role_slice.stop, len(toks)-2)
-            self._loss_slice = slice(self._assistant_role_slice.stop-1, len(toks)-3)
-
-        # -------------- 关键清理 --------------
-        # 其他模型分支全部删除冗余切片计算
-        else:
-            pass
-
-        self.conv_template.messages = []
-        return prompt
-
-    def get_input_ids(self, adv_string=None):
-        prompt = self.get_prompt(adv_string=adv_string)
-        toks = self.tokenizer(prompt).input_ids
-        input_ids = torch.tensor(toks[:self._target_slice.stop])
-        return input_ids
-
-    def control_slice(self, toks=None):
-        return self._control_slice if toks is None else toks[self._control_slice]
-    def target_slice(self, toks=None):
-        return self._target_slice if toks is None else toks[self._target_slice]
-    def loss_slice(self, toks=None):
-        return self._loss_slice if toks is None else toks[self._loss_slice]

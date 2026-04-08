@@ -27,6 +27,7 @@ output_path=os.path.join(output_path,str(timestamp))
 behaviors_config="output_20260331_revised_init.json"
 # 生成攻击行为ID列表：1-50（对应配置文件中50个有害行为）
 behavior_id_list = [i + 1 for i in range(50)]
+# behavior_id_list = list(range(50, 0, -1))
 # add id to black_list to skip the id
 # 以下为预留的黑白名单配置（注释状态，可启用）：
 # 黑名单：添加需要跳过的攻击ID，执行时会过滤掉这些ID
