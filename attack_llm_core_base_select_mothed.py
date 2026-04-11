@@ -43,7 +43,7 @@ class SuffixManagerMulTarget:
         self.target_sim_list = target_sim_list  # 只存文本，足够！
         self.adv_string = adv_string
         self.input_ids = self.get_input_ids(adv_string=adv_string)
-        #self.sim_input_ids = self.get_sim_input_ids(adv_string=adv_string)
+        self.sim_input_ids_list = self.get_sim_input_ids(adv_string=adv_string)
 
 
 
@@ -130,19 +130,20 @@ class SuffixManagerMulTarget:
 
 
     def get_sim_input_ids(self, adv_string=None):
-        sim_input_ids = []
+        sim_input_ids_list = []
+        self.input_ids = self.get_input_ids(adv_string=adv_string)
         slince_main = {"user_role_slice":self._user_role_slice,"goal_slice":self._goal_slice,"control_slice":self._control_slice,
               "assistant_role_slice":self._assistant_role_slice,"target_slice":self._target_slice,"loss_slice":self._loss_slice}
-        sim_input_ids.append((self.input_ids,slince_main))
+        sim_input_ids_list.append((self.input_ids,slince_main))
         for target in self.target_sim_list:
             prompt, slices = self.get_mul_prompt(adv_string=adv_string,target=target)
            # input_ids_e= slices["input_ids"]
             toks = self.tokenizer(prompt).input_ids
             target_slice_stop= slices["target_slice"].stop
             input_ids = torch.tensor(toks[:target_slice_stop])
-            sim_input_ids.append((input_ids,slices))
+            sim_input_ids_list.append((input_ids,slices))
 
-        return sim_input_ids
+        return sim_input_ids_list
 
     def control_slice(self, toks=None):
         return self._control_slice if toks is None else toks[self._control_slice]
@@ -171,9 +172,9 @@ def get_model_embedding_layer(model):
         raise ValueError("未识别的模型结构，请手动指定嵌入层路径！")
 
 
-def token_gradients_mul(model, input_ids, control_slice, target_slice, loss_slice,
+def token_gradients_mul(model,input_ids,control_slice,target_slice,loss_slice,
                         suffix_manager, tokenizer, device,adv_suffix,
-                        current_target_index,
+                        current_target_index,sim_input_list,
                         update_counter,
                         args=None,
                         test_prefixes=None):
@@ -182,31 +183,33 @@ def token_gradients_mul(model, input_ids, control_slice, target_slice, loss_slic
     """
 
     best_target_str = ""
-    sim_input = suffix_manager.get_sim_input_ids(adv_suffix)
-    current_sim_input = sim_input[current_target_index]
+    #sim_input = suffix_manager.get_sim_input_ids(adv_suffix)
+    current_sim_input = sim_input_list[current_target_index]
 
     # ===================== 【你要改的就这3行！】
-    current_sim_input_ids = suffix_manager.input_ids.to(device)  # 永远用原始单目标输入
+    # current_sim_input_ids = suffix_manager.input_ids.to(device)  # 永远用原始单目标输入
+    #current_sim_input_ids = current_sim_input[0].to(device)
     current_sim_input_slices = current_sim_input[1]  # 只取目标对应的切片
-    control_slice = suffix_manager._control_slice  # 原始control_slice
-    loss_slice = current_sim_input_slices["loss_slice"]  # 目标对应的loss位置
+    #control_slice = suffix_manager._control_slice  # 原始control_slice
+    #control_slice = current_sim_input_slices["control_slice"]
+    #loss_slice = current_sim_input_slices["loss_slice"]  # 目标对应的loss位置
 
     embed_weights = get_embedding_matrix(model)
     one_hot = torch.zeros(
-        current_sim_input_ids[control_slice].shape[0],
+        input_ids[control_slice].shape[0],
         embed_weights.shape[0],
         device=model.device,
         dtype=embed_weights.dtype
     )
     one_hot.scatter_(
         dim=1,
-        index=current_sim_input_ids[control_slice].unsqueeze(1),
+        index=input_ids[control_slice].unsqueeze(1),
         src=torch.ones(one_hot.shape[0], 1, device=model.device, dtype=embed_weights.dtype)
     )
     one_hot.requires_grad_()
     # 2. 生成嵌入并前向传播
     input_embeds = (one_hot @ embed_weights).unsqueeze(0)
-    embeds = get_embeddings(model, current_sim_input_ids.unsqueeze(0)).detach()
+    embeds = get_embeddings(model, input_ids.unsqueeze(0)).detach()
     full_embeds = torch.cat(
         [embeds[:, :control_slice.start, :], input_embeds, embeds[:, control_slice.stop:, :]],
         dim=1
@@ -221,37 +224,34 @@ def token_gradients_mul(model, input_ids, control_slice, target_slice, loss_slic
     if  update_counter >= stick_steps:
         min_loss = float('inf')
         best_idx = -1
-        for idx, sim_item in enumerate(sim_input):
+        for idx, sim_item in enumerate(sim_input_list):
             sim_ids, sim_slices = sim_item  # ✅ 取当前目标的 input_ids 和 slices
-            tar_slice = sim_slices["target_slice"]
-            los_slice = sim_slices["loss_slice"]
+            #tar_slice = sim_slices["target_slice"]
+            #los_slice = sim_slices["loss_slice"]
 
             # ✅ 取当前目标的真实标签
-            targets = sim_ids[tar_slice].to(device)
-            logit = logits[0, los_slice, :]
-
+            targets = sim_ids[target_slice].to(device)
+            logit = logits[0, loss_slice, :]
+            print(logit.shape[0], targets.shape[0])
             # 防止长度不匹配报错
             if logit.shape[0] != targets.shape[0]:
-                continue
+                print( logit.shape[0] , targets.shape[0] )
+                raise Exception("logit.shape[0] != targets.shape[0]")
 
             current_loss = nn.CrossEntropyLoss()(logit, targets)
             if current_loss < min_loss:
                 min_loss = current_loss
                 best_idx = idx
-
             # ✅ 更新到最优目标
         current_target_index = best_idx
         # 🔥 【关键】切换目标后必须重新加载新目标的切片！
-        current_sim_input = sim_input[current_target_index]
-        current_sim_input_slices = current_sim_input[1]
-        target_slice = current_sim_input_slices["target_slice"]
-        loss_slice = current_sim_input_slices["loss_slice"]
+        #current_sim_input = sim_input_list[current_target_index]
+        #current_sim_input_slices = current_sim_input[1]
+        #target_slice = current_sim_input_slices["target_slice"]
+        #loss_slice = current_sim_input_slices["loss_slice"]
     else:
-        # current_sim_input = sim_input[current_target_index]
-        # current_sim_input_ids = current_sim_input[0]
-        # current_sim_input_slices = current_sim_input[1]
-        target_slice = current_sim_input_slices["target_slice"]
-        targets = current_sim_input_ids[target_slice]
+        # target_slice = current_sim_input_slices["target_slice"]
+        targets = input_ids[target_slice]
         target_str = tokenizer.decode(targets, skip_special_tokens=True)
         best_target_str = target_str
         # 计算 loss
@@ -330,15 +330,15 @@ def check_for_attack_success(model, tokenizer, input_ids, assistant_role_slice, 
     jailbroken = not any([prefix in gen_str for prefix in test_prefixes])
     return jailbroken, gen_str
 
-# ===================== 修复：余弦相似度计算 =====================
-def compute_both_scores(model, tokenizer, logits, ids, suffix_manager, device):
+
+def compute_both_scores(model, tokenizer, logits, ids, target_slice, args,test_prefixes,device):
     """
     计算 CE 和 Cosine 分数，使用梯度选中的最优目标进行筛选
     """
 
     # ✅ 统一目标选择逻辑
 
-    target_slice =  suffix_manager._target_slice
+    #target_slice =  suffix_manager._target_slice
     target_ids =  ids[: , target_slice]
 
     # --------------------- 1. 交叉熵（梯度来源，完全不变） ---------------------
@@ -351,37 +351,80 @@ def compute_both_scores(model, tokenizer, logits, ids, suffix_manager, device):
 
     # --------------------- 2. 余弦相似度 ---------------------
     embedding_layer = get_model_embedding_layer(model)
-    true_ids_embedding = embedding_layer(target_ids)  # ✅ 只获取一次，在循环外
+    true_ids_embedding = embedding_layer(target_ids)      # ✅ 只获取一次，在循环外
     # ✅ 调试用：解码目标字符串（只解码一次）
 
-    target_str = tokenizer.decode(target_ids[0], skip_special_tokens=True)
+    #target_str = tokenizer.decode(target_ids[0], skip_special_tokens=True)
     cosine_scores = []
+    contrast_scores = []  # 新增
     #print(f"✅ 目标句子：{target_str}")
-    full_pred_str_list = []
+    # full_pred_str_list = []
+    # ===================== 负样本配置（全局只算1次）=====================
+    max_neg_len = max(len(tokenizer.encode(s, add_special_tokens=False)) for s in test_prefixes)
+    neg_start = target_slice.start
+    neg_end = neg_start + max_neg_len
+
+    # ✅ 安全限制：不越界
+    seq_len = logits.shape[1]
+    neg_end = min(neg_end, seq_len)
+    neg_slice = slice(neg_start, neg_end)
+
+    # ===================== 预编码负样本（提速） =====================
+    neg_id_list = []
+    for s in test_prefixes:
+        nt = tokenizer.encode(s, add_special_tokens=False)
+        if len(nt) > max_neg_len:
+            nt = nt[:max_neg_len]
+        while len(nt) < max_neg_len:
+            nt.append(nt[-1])
+        nt = nt[:max_neg_len]
+        neg_id_list.append(torch.tensor(nt, device=device))
+
+    # ===================== 遍历每个候选 =====================
     for i in range(ids.shape[0]):
+        # 预测 token
         # --------------------- 调试输出（保留） ---------------------
-        full_pred_logits = logits[i]
-        full_pred_ids = full_pred_logits.argmax(dim=-1)
-        full_pred_str = tokenizer.decode(full_pred_ids, skip_special_tokens=True)
+        #full_pred_logits = logits[i]
+        #full_pred_ids = full_pred_logits.argmax(dim=-1)
+        #full_pred_str = tokenizer.decode(full_pred_ids, skip_special_tokens=True)
         # print(f"🔮 候选 {i} 完整输出：{full_pred_str}")
-        full_pred_str_list.append(full_pred_str)
-        # ----------------------------------------------------------
-        # logits[:, loss_slice, :] 就是模型预测的部分
+        #full_pred_str_list.append(full_pred_str)
+
         pred_logits = logits[i, loss_slice, :]
         pred_ids = pred_logits.argmax(dim=-1)
         pred_ids_embedding = embedding_layer(pred_ids)
-
-        # ✅ 使用循环外定义的 true_ids_embedding（不要覆盖！）
-        sim = F.cosine_similarity(true_ids_embedding[0], pred_ids_embedding, dim=-1).mean().item()
+        # 余弦
+        sim = F.cosine_similarity(true_ids_embedding[i], pred_ids_embedding, dim=-1).mean().item()
         cosine_scores.append(sim)
+        # ===================== 🔥 对比学习：正样本CE + 负样本CE =====================
+        # 1. 当前样本的正损失
+        pos_loss = losses[i]
+        # 2. 计算负样本损失
+        neg_logits = logits[i, neg_slice, :]
+        all_neg_losses = []
+        for ni in neg_id_list:
+            # 安全截断
+            nl = min(neg_logits.shape[0], ni.shape[0])
+            nl_loss = F.cross_entropy(neg_logits[:nl], ni[:nl])
+            all_neg_losses.append(nl_loss)
+        avg_neg_loss = torch.stack(all_neg_losses).mean()
+        # 🔥 对比损失 = 正样本CE + weight * exp(-负样本CE)
+        contrast_loss = pos_loss + args.neg_weight * torch.exp(-avg_neg_loss)
+        contrast_scores.append(contrast_loss.item())
 
-        # ========== 选出 相似度最高 的候选 ==========
+    # ===================== 选择最优 =====================
+    # ========== 选出 相似度最高 的候选 ==========
     cosine_scores = torch.tensor(cosine_scores, device=device)
     best_cos_id = cosine_scores.argmax()
     best_cos_sim = cosine_scores[best_cos_id].item()
+
+
+    contrast_scores = torch.tensor(contrast_scores, device=device)
+    best_contrast_id = contrast_scores.argmin()  # 损失越小越好
+
     #print(f" 🔮best_cos_id 选择  {best_cos_id}  完整输出：{full_pred_str_list[best_cos_id]!r}")
     #print(f" 🔮best_ce_id  选择  {best_ce_id}  完整输出：{full_pred_str_list[best_ce_id]!r}")
-    return best_ce_id.item(), current_loss, best_cos_id.item(), best_cos_sim
+    return best_ce_id.item(), current_loss, best_cos_id.item(), best_cos_sim ,best_contrast_id.item()
 
 # ===================== 修复：PPL 筛选函数（必须返回 ids） =====================
 def get_logits_ppl(model, tokenizer, input_ids, control_slice, test_controls, batch_size):
@@ -481,7 +524,7 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
 
     best_ce_loss = float('inf')
     best_cos_sim = -float('inf')
-    best_adv_suffix = adv_string_init
+    #best_adv_suffix = adv_string_init
 
     batch_size = args.batch_size
     topk = args.top_k
@@ -498,41 +541,49 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
         if not f.parent.exists():
             os.makedirs(f.parent, exist_ok=True)
 
-    for i in range(num_steps):
+    for i in range(1, num_steps + 1):
         try:
-            input_ids = suffix_manager.get_input_ids(adv_string=adv_suffix).to(device)
-
             # 自动选择：多目标 / 单目标
             if args.use_multi_target:
+                sim_input_list = suffix_manager.get_sim_input_ids(adv_string=adv_suffix)
+                current_sim_input = sim_input_list[current_target_index]
+                input_ids = current_sim_input[0].to(device)
+                current_sim_input_slices = current_sim_input[1]  # 只取目标对应的切片
+                control_slice = current_sim_input_slices["control_slice"]
+                target_slice = current_sim_input_slices["target_slice"]
+                loss_slice = current_sim_input_slices["loss_slice"]
+
                 coordinate_grad, best_target_str, current_target_index = token_gradients_mul(
-                    model, input_ids,
-                    suffix_manager._control_slice,
-                    suffix_manager._target_slice,
-                    suffix_manager._loss_slice,
+                    model,input_ids,control_slice,target_slice,loss_slice,
                     suffix_manager, tokenizer, device,
                     adv_suffix=adv_suffix,
                     current_target_index=current_target_index,
+                    sim_input_list =sim_input_list,
                     update_counter=update_counter,
                     args=args,
                     test_prefixes=test_prefixes
                 )
+                re_flag = torch.allclose(coordinate_grad_debug, coordinate_grad, atol=1e-6)
+                print(re_flag)
                 update_counter = update_counter + 1
             else:
+                input_ids = suffix_manager.get_input_ids(adv_string=adv_suffix).to(device)
+                control_slice = suffix_manager._control_slice
+                target_slice = suffix_manager._target_slice
                 coordinate_grad = token_gradients(
                     model, input_ids,
-                    suffix_manager._control_slice,
-                    suffix_manager._target_slice,
+                    control_slice,
+                    target_slice,
                     suffix_manager._loss_slice,
                 )
                 best_target_str = suffix_manager.target
             with torch.no_grad():
-                adv_suffix_tokens = input_ids[suffix_manager._control_slice].to(device)
+                adv_suffix_tokens = input_ids[control_slice].to(device)
                 new_adv_suffix_toks = sample_control(
                     adv_suffix_tokens, coordinate_grad,
                     batch_size=batch_size, topk=topk,
                     not_allowed_tokens=not_allowed_tokens
                 )
-
                 new_adv_suffix = get_filtered_cands(
                     tokenizer,
                     new_adv_suffix_toks,
@@ -541,27 +592,14 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
                 )
                 # Step 3.4 Compute loss on these candidates and take the argmin.
                 if not args.use_ppl_filter:
-                    if args.use_multi_target:
-                        sim_input = suffix_manager.get_sim_input_ids(adv_suffix)
-                        current_sim_input = sim_input[current_target_index]
-                        current_sim_input_ids = current_sim_input[0].to(device)
-                        current_sim_input_slices = current_sim_input[1]
-                        control_slice = current_sim_input_slices["control_slice"]
-                        get_logits_input_ids =current_sim_input_ids
-                        get_logits_control_slice = control_slice
-                    else:
-                        get_logits_input_ids = input_ids
-                        get_logits_control_slice = suffix_manager._control_slice
-
                     logits, ids = get_logits(model=model,
                                              tokenizer=tokenizer,
-                                             input_ids=get_logits_input_ids,
-                                             control_slice=get_logits_control_slice,
+                                             input_ids=input_ids,
+                                             control_slice=control_slice,
                                              test_controls=new_adv_suffix,
                                              return_ids=True,
                                              batch_size=batch_size)
                     # input_ids_target = input_ids.unsqueeze(0).repeat(len(new_adv_suffix), 1).to(device)
-                    # target_slice =
                     # losses = target_loss(logits, ids, suffix_manager._target_slice)
                     # best_new_adv_suffix_id = losses.argmin()
                     # best_new_adv_suffix = new_adv_suffix[best_new_adv_suffix_id]
@@ -593,25 +631,30 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
                     logits = logits[selected_indices]
                     ids = ids[selected_indices]
                     print(f"[PPL] 生成:{len(ppl)} → 筛选后:{len(new_adv_suffix)}")
-                best_ce_id, current_ce_loss, best_cos_id, current_cos_sim = compute_both_scores(
+                best_ce_id, current_ce_loss, best_cos_id, current_cos_sim ,best_contrast_id = compute_both_scores(
                     model=model, tokenizer=tokenizer,
                     logits=logits,  ids = ids,
-                    suffix_manager=suffix_manager,
+                    target_slice=target_slice,
+                    args=args,
+                    test_prefixes=test_prefixes,
                     device=device)
                 # ===================== 选择后缀 =====================
                 if args.loss_type == "cross_entropy":
                     best_id = best_ce_id
-                else:
+                elif args.loss_type == "cosine":
                     best_id = best_cos_id
+                elif args.loss_type == "contrast":  # 新增
+                    best_id = best_contrast_id
 
                 best_new_adv_suffix = new_adv_suffix[best_id]
+                # 循环中每次更新的，每个循环中选择出的最优 后缀
                 adv_suffix = best_new_adv_suffix
+                # best_adv_suffix = best_new_adv_suffix
                 # 更新最优
                 if current_ce_loss < best_ce_loss:
                     best_ce_loss = current_ce_loss
                 if current_cos_sim > best_cos_sim:
                     best_cos_sim = current_cos_sim
-                best_adv_suffix = best_new_adv_suffix
                 # 测试
                 input_ids_new = suffix_manager.get_input_ids(adv_string=adv_suffix).to(device)
                 is_success, gen_str = check_for_attack_success(
@@ -639,7 +682,7 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
                     "best_cosine_sim": best_cos_sim,
                     "attack_success": is_success,
                     "ppl": ppl,
-                    "best_adv_suffix": best_adv_suffix,
+                    "best_adv_suffix": adv_suffix,
                     "current_suffix": best_new_adv_suffix,
                     "gen_str": gen_str[:200],
                     "target": suffix_manager.target,
@@ -681,7 +724,7 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
     best_result = {
         "optimize_target": args.loss_type,
         "use_ppl_filter": args.use_ppl_filter,  # <--- 已加
-        "best_adv_suffix": best_adv_suffix,
+        "best_adv_suffix": adv_suffix,
         "best_cross_entropy": best_ce_loss,
         "best_cosine_sim": best_cos_sim,
         "total_steps": len(log_dict)
@@ -721,16 +764,16 @@ if __name__ == '__main__':
     parser.add_argument('--output_path', type=str,
                         default=f'./output/{datetime.datetime.now().strftime("%Y%m%d-%H%M%S")}')
 
-    parser.add_argument('--batch_size', type=int, default=6)
-    parser.add_argument('--top_k', type=int, default=256)
+    parser.add_argument('--batch_size', type=int, default=4)
+    parser.add_argument('--top_k', type=int, default=128)
     parser.add_argument('--num_steps', type=int, default=500)
     parser.add_argument('--early_stop', type=bool, default=True)
-    parser.add_argument('--loss_type', type=str, default="cross_entropy", choices=["cross_entropy", "cosine"])
+    parser.add_argument('--loss_type', type=str, default="cross_entropy", choices=["cross_entropy", "cosine", "contrast"])
     parser.add_argument('--use_ppl_filter', type=lambda x: x.lower() == 'true', default=False)
-    parser.add_argument('--str_init',  type=str, default="adv_init_suffix2")
-    parser.add_argument('--stick_steps', type=int, default=10)
+    parser.add_argument('--str_init',  type=str, default="adv_init_suffix")
+    parser.add_argument('--stick_steps', type=int, default=3)
     parser.add_argument('--use_multi_target', type=lambda x: x.lower() == 'true', default=True)
-    parser.add_argument('--use_contrast_loss', type=lambda x: x.lower() == 'true', default=True)
+    parser.add_argument('--use_contrast_loss', type=lambda x: x.lower() == 'true', default=False)
     parser.add_argument('--neg_weight', type=float, default=1.0, help="负样本对比强度")
 
     args = parser.parse_args()
@@ -764,6 +807,18 @@ if __name__ == '__main__':
         target_sim_list=target_sim_list,  # ✅ 直接传列表
         adv_string=adv_string_init
     )
+
+    for current_sim_input in suffix_manager.sim_input_ids_list:
+        input_ids = current_sim_input[0].to(device)
+        # print(input_ids)
+        target_str = tokenizer.decode(input_ids, skip_special_tokens=True)
+        print(target_str)
+        current_sim_input_slices = current_sim_input[1]  # 只取目标对应的切片
+        control_slice = current_sim_input_slices["control_slice"]
+        target_slice = current_sim_input_slices["target_slice"]
+        loss_slice = current_sim_input_slices["loss_slice"]
+        print(control_slice, target_slice, loss_slice)
+
 
     print(f"\n启动对比实验 | 优化目标: {args.loss_type} | PPL Filter: {args.use_ppl_filter}| INIT: {adv_string_init} | use_multi_target: {args.use_multi_target}\n")
     # 优雅打印参数

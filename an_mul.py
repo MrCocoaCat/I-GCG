@@ -5,7 +5,7 @@ import numpy as np
 
 # ===================== 配置 =====================
 parser = argparse.ArgumentParser(description="多目标效果差 深度诊断脚本")
-parser.add_argument('--output_path', type=str, default=r'D:\GitHub\I-GCG\test_select_method\ours\20260408-021000')
+parser.add_argument('--output_path', type=str, default=r'D:\GitHub\I-GCG\test_select_method\ours\20260411-044121')
 parser.add_argument('--loss_type', type=str, default="cross_entropy")
 parser.add_argument('--use_ppl_filter', type=lambda x: x.lower() == 'true', default=False)
 parser.add_argument('--str_init', type=str, default="adv_init_suffix")

@@ -1,11 +1,10 @@
 import json
 import pathlib
 import argparse
-import datetime
 
 # ===================== 1. 配置解析 =====================
 parser = argparse.ArgumentParser(description="GCG 攻击结果自动评估脚本")
-parser.add_argument('--output_path', type=str, default=r'D:\GitHub\I-GCG\test_select_method\ours\20260408-021000')
+parser.add_argument('--output_path', type=str, default=r'D:\GitHub\I-GCG\test_select_method\ours\20260411-044121')
 parser.add_argument('--batch_size', type=int, default=6)
 parser.add_argument('--loss_type', type=str, default="cross_entropy", choices=["cross_entropy", "cosine"])
 parser.add_argument('--use_ppl_filter', type=lambda x: x.lower() == 'true', default=False)
@@ -16,28 +15,16 @@ args = parser.parse_args()
 
 
 # ===================== 2. 核心分析函数 =====================
-def analyze_results(file_prefix, method_name, max_possible_id=200):
-    exist_ids = []
+def analyze_results(file_prefix, method_name, common_ids):
     success_count = 0
-    success_steps = []       # 只存成功的步数
-    all_sample_steps = []   # 所有样本的步数（成功+失败）
+    success_steps = []
+    all_sample_steps = []
 
     print(f"\n正在分析 {method_name} ...")
+    exist_count = len(common_ids)
+    print(f"→ 共用 {exist_count} 个样本")
 
-    for run_id in range(1, max_possible_id + 1):
-        file_path = pathlib.Path(f"{file_prefix}_{run_id}.json")
-        if file_path.exists():
-            exist_ids.append(run_id)
-
-    if not exist_ids:
-        print(f"→ 无任何文件存在")
-        return (method_name, 0, 0, 0, 0.0, 0.0, 0.0)
-
-    exist_count = len(exist_ids)
-    print(f"→ 存在文件 ID: {sorted(exist_ids)}")
-    print(f"→ 共 {exist_count} 个有效样本")
-
-    for run_id in exist_ids:
+    for run_id in common_ids:
         file_path = pathlib.Path(f"{file_prefix}_{run_id}.json")
         try:
             with open(file_path, 'r', encoding='utf-8') as f:
@@ -55,23 +42,20 @@ def analyze_results(file_prefix, method_name, max_possible_id=200):
                     first_success_step = step_data.get('step', 0)
                     break
 
-            # === 2. 最终步检查 ===
+            # === 2. 最终步 ===
             final_step = data[-1].get('step', 0)
-            if not is_success:
-                final_step = data[-1].get('step', 0)
 
-            # === 3. 统计：所有样本都计入总平均步数 ===
+            # === 3. 统计 ===
             if is_success:
                 success_count += 1
                 success_steps.append(first_success_step)
-                all_sample_steps.append(first_success_step)  # 成功计入
+                all_sample_steps.append(first_success_step)
             else:
-                all_sample_steps.append(final_step)         # 失败也计入（用总步数）
+                all_sample_steps.append(final_step)
 
         except Exception as e:
             print(f"[异常] {file_path.name}: {str(e)}")
 
-    # 计算两种平均步数
     success_rate = (success_count / exist_count * 100) if exist_count > 0 else 0.0
     avg_steps_success = sum(success_steps) / len(success_steps) if len(success_steps) > 0 else 0.0
     avg_steps_total = sum(all_sample_steps) / len(all_sample_steps) if len(all_sample_steps) > 0 else 0.0
@@ -83,26 +67,43 @@ def analyze_results(file_prefix, method_name, max_possible_id=200):
 # ===================== 3. 主函数 =====================
 def main():
     print("=" * 70)
-    print("GCG 对抗攻击结果自动评估脚本（成功平均步数 + 全体平均步数）")
+    print("GCG 对抗攻击结果自动评估脚本（统一样本公平对比）")
     print("=" * 70)
 
     ppl_suffix = "ppl" if args.use_ppl_filter else ""
     log_dir = pathlib.Path(args.output_path) / "log"
 
     method_configs = [
-        {"name": "单目标 - Contrast Loss",    "con_loss": "contrast", "mu": ""},
-        {"name": "多目标 - Contrast Loss",    "con_loss": "contrast", "mu": "multi"},
-        {"name": "单目标 - No Contrast Loss", "con_loss": "",         "mu": ""},
-        {"name": "多目标 - No Contrast Loss", "con_loss": "",         "mu": "multi"}
+        {"name": "单目标 - Contrast Loss",    "con_loss": "contrast", "mu": ""    , "loss_type": "cross_entropy",},
+        {"name": "单目标 - No Contrast Loss", "con_loss": "",         "mu": "",     "loss_type": "cross_entropy"},
+        {"name": "单目标 - loss type Contrast   ", "con_loss": "",  "mu": ""    , "loss_type": "contrast"},
+        {"name": "多目标 - Contrast Loss", "con_loss": "contrast", "mu": "multi", "loss_type": "cross_entropy"},
+        {"name": "多目标 - No Contrast Loss", "con_loss": "",         "mu": "multi","loss_type": "cross_entropy"}
     ]
 
+    # ============== 关键：获取所有方法共同存在的样本 ID ==============
+    id_sets = []
+    for cfg in method_configs:
+        file_prefix = log_dir / f'{cfg["mu"]}_{cfg["con_loss"]}_{cfg["loss_type"]}_{ppl_suffix}_{args.str_init}'
+        ids = set()
+        for run_id in range(1, 200):
+            f_path = pathlib.Path(f"{file_prefix}_{run_id}.json")
+            if f_path.exists():
+                ids.add(run_id)
+        id_sets.append(ids)
+
+    common_ids = sorted(set.intersection(*id_sets))
+    print(f"\n✅ 所有方法共用样本 ID: {common_ids}")
+    print(f"✅ 共 {len(common_ids)} 个对比样本")
+
+    # ============== 统一用 common_ids 评估 ==============
     results = []
     for cfg in method_configs:
         file_prefix = log_dir / f'{cfg["mu"]}_{cfg["con_loss"]}_{args.loss_type}_{ppl_suffix}_{args.str_init}'
-        res = analyze_results(file_prefix, cfg["name"])
+        res = analyze_results(file_prefix, cfg["name"], common_ids)
         results.append(res)
 
-    # ===================== 输出表格（新增一列）=====================
+    # ===================== 输出表格 =====================
     print("\n" + "=" * 100)
     print(f"{'方法':<22} | {'存在':<5} | {'成功':<5} | {'失败':<5} | {'成功率':<9} | {'成功平均步数':<10} | {'全体平均步数'}")
     print("-" * 100)
@@ -122,10 +123,6 @@ def main():
     res1, res2 = results[0], results[1]
     _, exist1, suc1, _, rate1, step1, total1 = res1
     _, exist2, suc2, _, rate2, step2, total2 = res2
-
-    if exist1 == 0 or exist2 == 0:
-        print("→ 有效样本不足")
-        return
 
     diff_rate = rate2 - rate1
     if diff_rate > 0:
