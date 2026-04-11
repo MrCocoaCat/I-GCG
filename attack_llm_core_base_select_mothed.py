@@ -563,8 +563,8 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
                     args=args,
                     test_prefixes=test_prefixes
                 )
-                re_flag = torch.allclose(coordinate_grad_debug, coordinate_grad, atol=1e-6)
-                print(re_flag)
+                #re_flag = torch.allclose(coordinate_grad_debug, coordinate_grad, atol=1e-6)
+                #print(re_flag)
                 update_counter = update_counter + 1
             else:
                 input_ids = suffix_manager.get_input_ids(adv_string=adv_suffix).to(device)
@@ -861,4 +861,4 @@ if __name__ == '__main__':
     gc.collect()
     # ✅ 修复：正确计算耗时
     cost_time = time.time() - start
-    print(f"\n✅ 样本 {args.id} 实验完成，耗时 {cost_time:.2f} 秒！双指标日志已保存，{args} ")
+    print(f"\n✅ 样本 {args.id} 实验完成，耗时 {cost_time:.2f} 秒！日志已保存，{args} ")
