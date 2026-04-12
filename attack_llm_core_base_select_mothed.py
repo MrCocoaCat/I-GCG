@@ -183,16 +183,6 @@ def token_gradients_mul(model,input_ids,control_slice,target_slice,loss_slice,
     """
 
     best_target_str = ""
-    #sim_input = suffix_manager.get_sim_input_ids(adv_suffix)
-    current_sim_input = sim_input_list[current_target_index]
-
-    # ===================== 【你要改的就这3行！】
-    # current_sim_input_ids = suffix_manager.input_ids.to(device)  # 永远用原始单目标输入
-    #current_sim_input_ids = current_sim_input[0].to(device)
-    current_sim_input_slices = current_sim_input[1]  # 只取目标对应的切片
-    #control_slice = suffix_manager._control_slice  # 原始control_slice
-    #control_slice = current_sim_input_slices["control_slice"]
-    #loss_slice = current_sim_input_slices["loss_slice"]  # 目标对应的loss位置
 
     embed_weights = get_embedding_matrix(model)
     one_hot = torch.zeros(
@@ -216,39 +206,51 @@ def token_gradients_mul(model,input_ids,control_slice,target_slice,loss_slice,
     )
     outputs = model(inputs_embeds=full_embeds)
     logits = outputs.logits
-    # 3. 【关键修改】遍历所有目标，记录最优目标的完整信息
-    # all_target_texts = [suffix_manager.target] + suffix_manager.target_sim_list
-    stick_steps = args.stick_steps
 
     # 或者累计的步数大于stick_steps 时
-    if  update_counter >= stick_steps:
+    if  update_counter >=  args.stick_steps or update_counter == 0:
         min_loss = float('inf')
         best_idx = -1
         for idx, sim_item in enumerate(sim_input_list):
-            sim_ids, sim_slices = sim_item  # ✅ 取当前目标的 input_ids 和 slices
-            #tar_slice = sim_slices["target_slice"]
-            #los_slice = sim_slices["loss_slice"]
-
-            # ✅ 取当前目标的真实标签
+            # ✅ 取出【当前目标】的全部配置（关键修复）
+            sim_ids, sim_slices = sim_item
+            target_slice = sim_slices["target_slice"]
+            loss_slice = sim_slices["loss_slice"]  # 🔥 必须用当前目标的loss_slice
+            # ##############################
+            # 🔥 我只在这里加打印！
+            # 🔥 【合并版：一行看清所有关键信息】
+            target_str = tokenizer.decode(sim_ids[target_slice], skip_special_tokens=True)
+            target_len = len(sim_ids[target_slice])
+            logit_len = loss_slice.stop - loss_slice.start
             targets = sim_ids[target_slice].to(device)
-            logit = logits[0, loss_slice, :]
-            print(logit.shape[0], targets.shape[0])
-            # 防止长度不匹配报错
-            if logit.shape[0] != targets.shape[0]:
-                print( logit.shape[0] , targets.shape[0] )
-                raise Exception("logit.shape[0] != targets.shape[0]")
 
+            logit = logits[0, loss_slice, :]
+            pred_tokens = logit.argmax(dim=-1)
+            pred_str = tokenizer.decode(pred_tokens, skip_special_tokens=True)
+            # ===================== 【合并输出】=====================
+            print(f"id: [{idx}] "
+                  f"logit_len={logit_len:2d} | "
+                  f"target_len={target_len:2d} | "
+                  f"loss_slice={loss_slice} | "
+                  f"target_slice={target_slice}")
+            print(f"🎯 这是数据集中得数据，TARGET: {repr(target_str)}")
+            print(f"🤖 这是模型输出得结果，PREDIC: {repr(pred_str)}")
+            # ======================================================
+            # 安全检查
+            if logit.shape[0] != targets.shape[0]:
+                print(f"长度不匹配 logit={logit.shape[0]}, target={targets.shape[0]}")
+                # ✅ 强制对齐长度（终极保险）
+                min_len = min(logit.shape[0], targets.shape[0])
+                logit = logit[:min_len]
+                targets = targets[:min_len]
+            print(f"计算CR 的形状  logit={logit.shape}, target={targets.shape}")
             current_loss = nn.CrossEntropyLoss()(logit, targets)
+            print(f"current_loss={current_loss},min_loss={min_loss}")
             if current_loss < min_loss:
                 min_loss = current_loss
                 best_idx = idx
-            # ✅ 更新到最优目标
+        # ✅ 更新到最优目标
         current_target_index = best_idx
-        # 🔥 【关键】切换目标后必须重新加载新目标的切片！
-        #current_sim_input = sim_input_list[current_target_index]
-        #current_sim_input_slices = current_sim_input[1]
-        #target_slice = current_sim_input_slices["target_slice"]
-        #loss_slice = current_sim_input_slices["loss_slice"]
     else:
         # target_slice = current_sim_input_slices["target_slice"]
         targets = input_ids[target_slice]
@@ -279,7 +281,7 @@ def token_gradients_mul(model,input_ids,control_slice,target_slice,loss_slice,
             neg_loss = F.cross_entropy(neg_logits, neg_ids)
             all_neg_losses.append(neg_loss)
         avg_neg_loss = torch.stack(all_neg_losses).mean().detach()
-        loss = min_loss + args.neg_weight * torch.exp(-avg_neg_loss)
+        loss = min_loss - args.neg_weight * avg_neg_loss
     loss.backward()
     one_hot_grad = one_hot.grad.clone()
     grad_l2 = one_hot_grad / one_hot_grad.norm(dim=-1, keepdim=True)
@@ -331,7 +333,7 @@ def check_for_attack_success(model, tokenizer, input_ids, assistant_role_slice, 
     return jailbroken, gen_str
 
 
-def compute_both_scores(model, tokenizer, logits, ids, target_slice, args,test_prefixes,device):
+def  compute_both_scores(model, tokenizer, logits, ids, target_slice, args,test_prefixes,device):
     """
     计算 CE 和 Cosine 分数，使用梯度选中的最优目标进行筛选
     """
@@ -346,8 +348,10 @@ def compute_both_scores(model, tokenizer, logits, ids, target_slice, args,test_p
     loss_slice = slice(target_slice.start-1, target_slice.stop - 1)
     loss_re = crit(logits[:, loss_slice, :].transpose(1, 2), target_ids)
     losses = loss_re.mean(dim=-1)
-    best_ce_id = losses.argmin()
-    current_loss = losses[best_ce_id].item()
+
+    best_loss = losses.min()
+    global_worst_loss = losses.max()
+
 
     # --------------------- 2. 余弦相似度 ---------------------
     embedding_layer = get_model_embedding_layer(model)
@@ -375,8 +379,8 @@ def compute_both_scores(model, tokenizer, logits, ids, target_slice, args,test_p
         nt = tokenizer.encode(s, add_special_tokens=False)
         if len(nt) > max_neg_len:
             nt = nt[:max_neg_len]
-        while len(nt) < max_neg_len:
-            nt.append(nt[-1])
+        # while len(nt) < max_neg_len:
+        #     nt.append(nt[-1])
         nt = nt[:max_neg_len]
         neg_id_list.append(torch.tensor(nt, device=device))
 
@@ -409,8 +413,18 @@ def compute_both_scores(model, tokenizer, logits, ids, target_slice, args,test_p
             all_neg_losses.append(nl_loss)
         avg_neg_loss = torch.stack(all_neg_losses).mean()
         # 🔥 对比损失 = 正样本CE + weight * exp(-负样本CE)
-        contrast_loss = pos_loss + args.neg_weight * torch.exp(-avg_neg_loss)
+        # contrast_loss = -torch.log( torch.exp(pos_loss) / (torch.exp(pos_loss) + torch.exp(avg_neg_loss)) )
+
+        pos_score = torch.exp(-pos_loss)
+        neg_score = torch.exp(-global_worst_loss)
+        contrast_loss = -torch.log(pos_score / (pos_score + neg_score))
+
+        #contrast_loss = pos_loss + args.neg_weight * torch.exp(-avg_neg_loss)
+
         contrast_scores.append(contrast_loss.item())
+
+        # 🔥 论文级对比损失，一定有效
+
 
     # ===================== 选择最优 =====================
     # ========== 选出 相似度最高 的候选 ==========
@@ -418,13 +432,19 @@ def compute_both_scores(model, tokenizer, logits, ids, target_slice, args,test_p
     best_cos_id = cosine_scores.argmax()
     best_cos_sim = cosine_scores[best_cos_id].item()
 
+    best_ce_id = losses.argmin()
+    ce_loss = losses[best_ce_id].item()
 
     contrast_scores = torch.tensor(contrast_scores, device=device)
     best_contrast_id = contrast_scores.argmin()  # 损失越小越好
+    contrast_loss = contrast_scores[best_contrast_id].item()
+
+    print(f"CE: {losses}, \n contrast_scores: {contrast_scores}, \ncosine_scores: {cosine_scores}")
+
 
     #print(f" 🔮best_cos_id 选择  {best_cos_id}  完整输出：{full_pred_str_list[best_cos_id]!r}")
     #print(f" 🔮best_ce_id  选择  {best_ce_id}  完整输出：{full_pred_str_list[best_ce_id]!r}")
-    return best_ce_id.item(), current_loss, best_cos_id.item(), best_cos_sim ,best_contrast_id.item()
+    return best_ce_id.item(), ce_loss, best_cos_id.item(), best_cos_sim ,best_contrast_id.item(),contrast_loss
 
 # ===================== 修复：PPL 筛选函数（必须返回 ids） =====================
 def get_logits_ppl(model, tokenizer, input_ids, control_slice, test_controls, batch_size):
@@ -631,7 +651,7 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
                     logits = logits[selected_indices]
                     ids = ids[selected_indices]
                     print(f"[PPL] 生成:{len(ppl)} → 筛选后:{len(new_adv_suffix)}")
-                best_ce_id, current_ce_loss, best_cos_id, current_cos_sim ,best_contrast_id = compute_both_scores(
+                best_ce_id, current_ce_loss, best_cos_id, current_cos_sim ,best_contrast_id, contrast_loss = compute_both_scores(
                     model=model, tokenizer=tokenizer,
                     logits=logits,  ids = ids,
                     target_slice=target_slice,
@@ -678,6 +698,7 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
                     "use_ppl_filter": args.use_ppl_filter,  # <--- 已加
                     "current_cross_entropy": current_ce_loss,
                     "current_cosine_sim": current_cos_sim,
+                    "current_contrast_loss": contrast_loss,
                     "best_cross_entropy": best_ce_loss,
                     "best_cosine_sim": best_cos_sim,
                     "attack_success": is_success,
@@ -759,7 +780,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="GCG终极对比版：同时记录CE与Cosine最优值")
     parser.add_argument('--model_path', type=str, default=r"D:\Model\Llama-2-7b-chat-hf")
     parser.add_argument('--device', type=int, default=0)
-    parser.add_argument('--id', type=int, default=1)
+    parser.add_argument('--id', type=int, default=42)
     parser.add_argument('--behaviors_config', type=str, default="output_20260331_revised_init.json")
     parser.add_argument('--output_path', type=str,
                         default=f'./output/{datetime.datetime.now().strftime("%Y%m%d-%H%M%S")}')
@@ -774,7 +795,7 @@ if __name__ == '__main__':
     parser.add_argument('--stick_steps', type=int, default=3)
     parser.add_argument('--use_multi_target', type=lambda x: x.lower() == 'true', default=True)
     parser.add_argument('--use_contrast_loss', type=lambda x: x.lower() == 'true', default=False)
-    parser.add_argument('--neg_weight', type=float, default=1.0, help="负样本对比强度")
+    parser.add_argument('--neg_weight', type=float, default=500.0, help="负样本对比强度")
 
     args = parser.parse_args()
     set_seed(42)
