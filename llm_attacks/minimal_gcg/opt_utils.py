@@ -13,7 +13,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from llm_attacks import get_embedding_matrix, get_embeddings
 import random
 
-def token_gradients(model, input_ids, input_slice, target_slice, loss_slice):
+def token_gradients(model, input_ids, input_slice, target_slice, loss_slice,tokenizer):
 
     """
     Computes gradients of the loss with respect to the coordinates.
@@ -86,6 +86,14 @@ def token_gradients(model, input_ids, input_slice, target_slice, loss_slice):
     # print("手动计算logits与outputs.logits是否一致:", torch.allclose(outputs.logits, manual_logits, atol=1e-5))
     targets = input_ids[target_slice]
     outputs_targets_logits = logits[0,loss_slice,:]
+
+
+    target_str = tokenizer.decode(targets, skip_special_tokens=True)
+    pred_tokens = outputs_targets_logits.argmax(dim=-1)
+    pred_str = tokenizer.decode(pred_tokens, skip_special_tokens=True)
+    print(f"🎯 ，上次优化的结果进入循环，用于初始化onehot 矩阵，这是数据集中得数据，TARGET: {repr(target_str)}")
+    print(f"🤖 这是模型输出得结果，PREDIC: {repr(pred_str)}")
+
     loss = nn.CrossEntropyLoss()(outputs_targets_logits, targets)
     # 7. 反向传播计算梯度（仅更新one_hot.grad）
     loss.backward()
@@ -234,6 +242,7 @@ def sample_control(control_toks, grad, batch_size, topk=256, temp=1, not_allowed
 
     # 生成[batch_size,1] 的随机整数
     rand_idx = torch.randint(0, topk, (batch_size, 1),device=grad.device)
+    #selected_ranks = rand_idx.squeeze(1)  # <-- 这就是你要的：选了第几个！
 
     # 这是 PyTorch 中张量高级索引（整数索引）,将 top_indices 根据new_token_pos指向的位置进行索引扩展 ，
     #selected_topk = top_indices[new_token_pos]
@@ -258,6 +267,44 @@ def sample_control(control_toks, grad, batch_size, topk=256, temp=1, not_allowed
                                                       index = new_token_pos_u,
                                                       # 要替换进去的新值（随机选好的最优 Token ID）
                                                       src = new_token_val)
+
+    return new_control_toks
+
+
+def sample_control_weighted(control_toks, grad, model, batch_size, topk=256, temp=1, not_allowed_tokens=None, lambda_emb=0):
+    if not_allowed_tokens is not None:
+        grad[:, not_allowed_tokens.to(grad.device)] = float('inf')
+
+    # 分数
+    grad_score = -grad
+    emb = model.get_input_embeddings().weight.data
+    control_emb = emb[control_toks]
+    norm_c = control_emb / control_emb.norm(dim=-1, keepdim=True)
+    norm_e = emb / emb.norm(dim=-1, keepdim=True)
+    sim = norm_c @ norm_e.T
+    dist = 1 - sim
+    score = grad_score - lambda_emb * dist
+
+    # TOPK
+    topk_vals, top_indices = score.topk(topk, dim=1)
+
+    # 批次
+    control_toks = control_toks.to(grad.device)
+    original_control_toks = control_toks.repeat(batch_size, 1)
+    new_token_pos = torch.arange(0, len(control_toks), len(control_toks)/batch_size, device=grad.device).long()
+
+    # ✅ 关键：一次性 batch 加权采样，和原版完全同结构
+    selected_topk_vals = topk_vals[new_token_pos]
+    probs = torch.softmax(selected_topk_vals / temp, dim=-1)
+    idx = torch.multinomial(probs, num_samples=1)
+
+    # Gather
+    selected_topk_indices = top_indices[new_token_pos]
+    new_token_val = torch.gather(selected_topk_indices, 1, idx)
+
+    # Scatter
+    new_token_pos_u = new_token_pos.unsqueeze(-1)
+    new_control_toks = original_control_toks.scatter_(1, new_token_pos_u, new_token_val)
 
     return new_control_toks
 
@@ -361,9 +408,6 @@ def get_logits(*, model, tokenizer, input_ids, control_slice, test_controls=None
         logits = forward(model=model, input_ids=ids, attention_mask=attn_mask, batch_size=batch_size)
         del ids ; gc.collect()
         return logits
-
-
-
 
 
 def forward(*, model, input_ids, attention_mask, batch_size=512):

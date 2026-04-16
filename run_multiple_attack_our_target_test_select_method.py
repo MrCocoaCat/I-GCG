@@ -10,7 +10,7 @@ import argparse
 # 创建参数解析器对象，用于处理外部传入的参数
 parser = argparse.ArgumentParser()
 parser.add_argument('--defense', type=str, default="no_defense")
-parser.add_argument('--behaviors_config', type=str, default="behaviors_config.json")
+#parser.add_argument('--behaviors_config', type=str, default="behaviors_config.json")
 parser.add_argument('--output_path', type=str,default='ours')
 
 # ===================== 2. 全局配置初始化 =====================
@@ -24,7 +24,7 @@ timestamp = (datetime.datetime.now() + datetime.timedelta(hours=8)).strftime("%Y
 output_path=os.path.join("test_select_method",args.output_path)
 output_path=os.path.join(output_path,str(timestamp))
 
-behaviors_config="output_20260331_revised_init.json"
+behaviors_config="adv_similar.json"
 # 生成攻击行为ID列表：1-50（对应配置文件中50个有害行为）
 behavior_id_list = [i + 1 for i in range(50)]
 # behavior_id_list = list(range(50, 0, -1))
@@ -87,34 +87,15 @@ def worker_task(task_list, resource_manager):
 
         run_single_process_select_method(behavior_id = task, device = card.id, output_path = output_path,
                                          defense = defense,behaviors_config = behaviors_config, num_steps = num_steps,
-                                         batch_size=batch_size,loss_type="cross_entropy",model_path=model_path)
+                                         batch_size=batch_size,loss_type="cross_entropy",
+                                         model_path=model_path)
 
         run_single_process_select_method(behavior_id=task, device=card.id, output_path=output_path,
                                          defense=defense, behaviors_config=behaviors_config, num_steps=num_steps,
-                                         batch_size=batch_size, loss_type="contrast", model_path=model_path)
+                                         batch_size=batch_size, loss_type="cross_entropy",
+                                         model_path=model_path,
+                                         use_weighted_sample = "True")
 
-        run_single_process_select_method(behavior_id=task, device=card.id, output_path=output_path,
-                                         defense=defense, behaviors_config=behaviors_config, num_steps=num_steps,
-                                         batch_size=batch_size, loss_type="cross_entropy", model_path=model_path,
-                                         use_contrast_loss="TRUE")
-
-        run_single_process_select_method(behavior_id=task, device=card.id, output_path=output_path,
-                                         defense=defense, behaviors_config=behaviors_config, num_steps=num_steps,
-                                         batch_size=batch_size, loss_type="cross_entropy",model_path=model_path,use_multi_target = "TRUE")
-
-        # run_single_process_select_method(behavior_id=task, device=card.id, output_path=output_path,
-        #                                  defense=defense, behaviors_config=behaviors_config, num_steps=num_steps,
-        #                                  batch_size=batch_size, loss_type="cross_entropy", model_path=model_path,
-        #                                  use_multi_target="TRUE",use_contrast_loss="TRUE")
-
-        # run_single_process_select_method(behavior_id=task, device=card.id, output_path=output_path,
-        #                                  defense=defense, behaviors_config=behaviors_config, num_steps=num_steps,
-        #                                  batch_size=batch_size, loss_type="cross_entropy", str_init = "adv_init_suffix2",
-        #                                  model_path=model_path)
-        # run_single_process_select_method(behavior_id=task, device=card.id, output_path=output_path,
-        #                                  defense=defense, behaviors_config=behaviors_config, num_steps=num_steps,
-        #                                  batch_size=batch_size, loss_type="cross_entropy", str_init="adv_init_suffix2",
-        #                                  use_ppl_filter="True", model_path=model_path)
 
         resource_manager.release_card(card)
 

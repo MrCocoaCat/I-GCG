@@ -17,6 +17,7 @@ import numpy as np
 import torch
 import random
 
+
 # 修复路径配置逻辑
 repo_root = os.getenv("LLM_ATTACKS_ROOT")
 if not repo_root:
@@ -27,7 +28,7 @@ sys.path.append(os.path.abspath(repo_root))
 
 from llm_attacks.minimal_gcg.opt_utils import (
     token_gradients, sample_control, get_logits, generate,
-    load_model_and_tokenizer, get_filtered_cands,get_embedding_matrix,get_embeddings
+    load_model_and_tokenizer, get_filtered_cands,get_embedding_matrix,get_embeddings,sample_control_weighted
 )
 from llm_attacks.minimal_gcg.string_utils import SuffixManager, load_conversation_template
 from llm_attacks import get_nonascii_toks
@@ -46,7 +47,6 @@ class SuffixManagerMulTarget:
         self.sim_input_ids_list = self.get_sim_input_ids(adv_string=adv_string)
 
 
-
     def get_prompt(self, adv_string=None):
         if adv_string is not None:
             self.adv_string = adv_string
@@ -60,7 +60,6 @@ class SuffixManagerMulTarget:
             self.conv_template.append_message(self.conv_template.roles[0], None)
             toks = self.tokenizer(self.conv_template.get_prompt()).input_ids
             self._user_role_slice = slice(None, 4)
-
             self.conv_template.update_last_message(f"{self.instruction}")
             toks = self.tokenizer(self.conv_template.get_prompt()).input_ids
             self._goal_slice = slice(self._user_role_slice.stop, max(self._user_role_slice.stop, len(toks)-1))
@@ -77,6 +76,7 @@ class SuffixManagerMulTarget:
             self.conv_template.update_last_message(f"{self.target}")
             toks = self.tokenizer(self.conv_template.get_prompt()).input_ids
             self._target_slice = slice(self._assistant_role_slice.stop, len(toks)-2)
+          #  self._loss_slice = slice(self._assistant_role_slice.stop - 2, len(toks) - 4)  # 👈 统一改成 -2 / -4
             self._loss_slice = slice(self._assistant_role_slice.stop-1, len(toks)-3)
 
         # -------------- 关键清理 --------------
@@ -114,7 +114,18 @@ class SuffixManagerMulTarget:
             self.conv_template.update_last_message(f"{target}")
             toks = self.tokenizer(self.conv_template.get_prompt()).input_ids
             _target_slice = slice(_assistant_role_slice.stop, len(toks) - 2)
+            # _loss_slice = slice(_assistant_role_slice.stop-2, len(toks)-4)
             _loss_slice = slice(_assistant_role_slice.stop - 1, len(toks) - 3)
+            # ===================== 调试打印 =====================
+            target_len = len(toks[_target_slice])
+            loss_len = len(toks[_loss_slice])
+            print("\n===== [get_mul_prompt] 切片长度检查 =====")
+            print(f"target_slice: {_target_slice} | 长度: {target_len}")
+            print(f"loss_slice  : {_loss_slice}   | 长度: {loss_len}")
+            print(f"❌ 长度是否一致? {target_len == loss_len}")
+            print(f"目标文本: {repr(self.tokenizer.decode(toks[_target_slice], skip_special_tokens=True))}")
+            print(f"loss对应预测位置文本: {repr(self.tokenizer.decode(toks[_loss_slice], skip_special_tokens=True))}")
+            print("=" * 60)
         else:
             pass
         self.conv_template.messages = []
@@ -170,6 +181,7 @@ def get_model_embedding_layer(model):
         print("=== 模型结构预览（前10行）===")
         print(str(model)[:1000])
         raise ValueError("未识别的模型结构，请手动指定嵌入层路径！")
+
 
 
 def token_gradients_mul(model,input_ids,control_slice,target_slice,loss_slice,
@@ -249,6 +261,7 @@ def token_gradients_mul(model,input_ids,control_slice,target_slice,loss_slice,
             if current_loss < min_loss:
                 min_loss = current_loss
                 best_idx = idx
+                print(f"best_idx update to {best_idx}")
         # ✅ 更新到最优目标
         current_target_index = best_idx
     else:
@@ -258,6 +271,10 @@ def token_gradients_mul(model,input_ids,control_slice,target_slice,loss_slice,
         best_target_str = target_str
         # 计算 loss
         logit = logits[0, loss_slice, :]
+        pred_tokens = logit.argmax(dim=-1)
+        pred_str = tokenizer.decode(pred_tokens, skip_special_tokens=True)
+        print(f"🎯 这是数据集中得数据，TARGET: {repr(target_str)}")
+        print(f"🤖 这是模型输出得结果，PREDIC: {repr(pred_str)}")
         min_loss = nn.CrossEntropyLoss()(logit, targets)
     if not args.use_contrast_loss:
         loss = min_loss
@@ -333,7 +350,7 @@ def check_for_attack_success(model, tokenizer, input_ids, assistant_role_slice, 
     return jailbroken, gen_str
 
 
-def  compute_both_scores(model, tokenizer, logits, ids, target_slice, args,test_prefixes,device):
+def compute_both_scores(model, tokenizer, logits, ids, target_slice, args,test_prefixes,device):
     """
     计算 CE 和 Cosine 分数，使用梯度选中的最优目标进行筛选
     """
@@ -439,9 +456,7 @@ def  compute_both_scores(model, tokenizer, logits, ids, target_slice, args,test_
     best_contrast_id = contrast_scores.argmin()  # 损失越小越好
     contrast_loss = contrast_scores[best_contrast_id].item()
 
-    print(f"CE: {losses}, \n contrast_scores: {contrast_scores}, \ncosine_scores: {cosine_scores}")
-
-
+   # print(f"CE: {losses}, \n contrast_scores: {contrast_scores}, \ncosine_scores: {cosine_scores}")
     #print(f" 🔮best_cos_id 选择  {best_cos_id}  完整输出：{full_pred_str_list[best_cos_id]!r}")
     #print(f" 🔮best_ce_id  选择  {best_ce_id}  完整输出：{full_pred_str_list[best_ce_id]!r}")
     return best_ce_id.item(), ce_loss, best_cos_id.item(), best_cos_sim ,best_contrast_id.item(),contrast_loss
@@ -547,7 +562,6 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
     #best_adv_suffix = adv_string_init
 
     batch_size = args.batch_size
-    topk = args.top_k
     success_count = 0
     early_stop_threshold = 10
 
@@ -555,8 +569,9 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
     ppl_suffix = "ppl" if args.use_ppl_filter else ""
     mu = "multi" if args.use_multi_target else ""
     con_loss = "contrast" if args.use_contrast_loss else ""
-    submission_json_file = pathlib.Path(f'{args.output_path}/submission/{mu}{args.loss_type}{ppl_suffix}_{args.str_init}_{args.id}.json')
-    log_json_file = pathlib.Path(f'{args.output_path}/log/{mu}_{con_loss}_{args.loss_type}_{ppl_suffix}_{args.str_init}_{args.id}.json')
+    sample_method = "weighted_sample" if args.use_weighted_sample else ""
+    submission_json_file = pathlib.Path(f'{args.output_path}/submission/{mu}{args.loss_type}{ppl_suffix}_{args.str_init}_{sample_method}_{args.id}.json')
+    log_json_file = pathlib.Path(f'{args.output_path}/log/{mu}_{con_loss}_{args.loss_type}_{ppl_suffix}_{args.str_init}_{sample_method}_{args.id}.json')
     for f in [submission_json_file, log_json_file]:
         if not f.parent.exists():
             os.makedirs(f.parent, exist_ok=True)
@@ -572,19 +587,32 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
                 control_slice = current_sim_input_slices["control_slice"]
                 target_slice = current_sim_input_slices["target_slice"]
                 loss_slice = current_sim_input_slices["loss_slice"]
-
+                coordinate_grad_debug = token_gradients(
+                    model, input_ids,
+                    control_slice,
+                    target_slice,
+                    suffix_manager._loss_slice,
+                    tokenizer
+                )
                 coordinate_grad, best_target_str, current_target_index = token_gradients_mul(
                     model,input_ids,control_slice,target_slice,loss_slice,
                     suffix_manager, tokenizer, device,
                     adv_suffix=adv_suffix,
                     current_target_index=current_target_index,
-                    sim_input_list =sim_input_list,
+                    sim_input_list =sim_input_list,\
+
                     update_counter=update_counter,
                     args=args,
                     test_prefixes=test_prefixes
                 )
-                #re_flag = torch.allclose(coordinate_grad_debug, coordinate_grad, atol=1e-6)
-                #print(re_flag)
+                # 梯度一致性判断
+                re_flag = torch.allclose(coordinate_grad_debug, coordinate_grad, atol=1e-6)
+                if re_flag:
+                    print("###################################### mul same as singal  ######################################")
+                else:
+                    print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!! mul is diffents ! !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+                    print(f"coordinate_grad_debug:\n{coordinate_grad_debug}")
+                    print(f"coordinate_grad:\n{coordinate_grad}")
                 update_counter = update_counter + 1
             else:
                 input_ids = suffix_manager.get_input_ids(adv_string=adv_suffix).to(device)
@@ -594,16 +622,31 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
                     model, input_ids,
                     control_slice,
                     target_slice,
-                    suffix_manager._loss_slice,
+                    suffix_manager._loss_slice,tokenizer
                 )
                 best_target_str = suffix_manager.target
             with torch.no_grad():
+                top_k = args.top_k
                 adv_suffix_tokens = input_ids[control_slice].to(device)
-                new_adv_suffix_toks = sample_control(
-                    adv_suffix_tokens, coordinate_grad,
-                    batch_size=batch_size, topk=topk,
-                    not_allowed_tokens=not_allowed_tokens
-                )
+                # 加权采样开关
+                if args.use_weighted_sample:
+                    new_adv_suffix_toks = sample_control_weighted(
+                        adv_suffix_tokens, coordinate_grad,
+                        model = model,
+                        batch_size=batch_size, topk=top_k,
+                        not_allowed_tokens=not_allowed_tokens
+                    )
+                else:
+                    new_adv_suffix_toks = sample_control(
+                        adv_suffix_tokens, coordinate_grad,
+                        batch_size=batch_size, topk=top_k,
+                        not_allowed_tokens=not_allowed_tokens
+                    )
+                # new_adv_suffix_toks = sample_control(
+                #     adv_suffix_tokens, coordinate_grad,
+                #     batch_size=batch_size, topk=top_k,
+                #     not_allowed_tokens=not_allowed_tokens
+                # )
                 new_adv_suffix = get_filtered_cands(
                     tokenizer,
                     new_adv_suffix_toks,
@@ -630,7 +673,7 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
                     # adv_suffix_tokens = input_ids[suffix_manager._control_slice].to(device)
                     new_adv_suffix_toks = sample_control(
                         adv_suffix_tokens, coordinate_grad,
-                        batch_size=batch_size * 2, topk=topk,
+                        batch_size=batch_size * 2, topk=top_k,
                         not_allowed_tokens=not_allowed_tokens
                     )
                     new_adv_suffix = get_filtered_cands(
@@ -701,15 +744,15 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
                     "current_contrast_loss": contrast_loss,
                     "best_cross_entropy": best_ce_loss,
                     "best_cosine_sim": best_cos_sim,
+                    "top_k":top_k,
                     "attack_success": is_success,
                     "ppl": ppl,
                     "best_adv_suffix": adv_suffix,
                     "current_suffix": best_new_adv_suffix,
-                    "gen_str": gen_str[:200],
+                    "gen_str": gen_str,
                     "target": suffix_manager.target,
                     "target_best": best_target_str,
-                    "current_target_index": str(current_target_index),  # ✅ 记录目标类
-                    # ✅ 目标句子已记录
+                    "current_target_index": str(current_target_index),
                 }
                 log_dict.append(log_entry)
 
@@ -780,12 +823,12 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="GCG终极对比版：同时记录CE与Cosine最优值")
     parser.add_argument('--model_path', type=str, default=r"D:\Model\Llama-2-7b-chat-hf")
     parser.add_argument('--device', type=int, default=0)
-    parser.add_argument('--id', type=int, default=42)
-    parser.add_argument('--behaviors_config', type=str, default="output_20260331_revised_init.json")
+    parser.add_argument('--id', type=int, default=30)
+    parser.add_argument('--behaviors_config', type=str, default="adv_similar.json")
     parser.add_argument('--output_path', type=str,
                         default=f'./output/{datetime.datetime.now().strftime("%Y%m%d-%H%M%S")}')
 
-    parser.add_argument('--batch_size', type=int, default=4)
+    parser.add_argument('--batch_size', type=int, default=8)
     parser.add_argument('--top_k', type=int, default=128)
     parser.add_argument('--num_steps', type=int, default=500)
     parser.add_argument('--early_stop', type=bool, default=True)
@@ -793,9 +836,10 @@ if __name__ == '__main__':
     parser.add_argument('--use_ppl_filter', type=lambda x: x.lower() == 'true', default=False)
     parser.add_argument('--str_init',  type=str, default="adv_init_suffix")
     parser.add_argument('--stick_steps', type=int, default=3)
-    parser.add_argument('--use_multi_target', type=lambda x: x.lower() == 'true', default=True)
+    parser.add_argument('--use_multi_target', type=lambda x: x.lower() == 'true', default=False)
     parser.add_argument('--use_contrast_loss', type=lambda x: x.lower() == 'true', default=False)
     parser.add_argument('--neg_weight', type=float, default=500.0, help="负样本对比强度")
+    parser.add_argument('--use_weighted_sample', type=lambda x: x.lower() == 'true', default=False)
 
     args = parser.parse_args()
     set_seed(42)
@@ -806,7 +850,7 @@ if __name__ == '__main__':
     behavior_config = yaml.load(open(args.behaviors_config, 'r', encoding='utf-8'), Loader=yaml.FullLoader)[args.id - 1]
     user_prompt = behavior_config["behaviour"]
     target = behavior_config["target"]
-    adv_string_init = behavior_config[args.str_init]
+    adv_string_init = "! ! ! ! ! ! ! ! ! ! ! ! ! ! ! ! ! ! ! !"
 
     # 加载模型
 
@@ -819,7 +863,7 @@ if __name__ == '__main__':
     #     tokenizer=tokenizer, conv_template=conv_template,
     #     instruction=user_prompt, target=target, adv_string=adv_string_init
     # )
-    target_sim_list = [item["text"] for item in behavior_config["target_similar"]]
+    target_sim_list = [item["text"] for item in behavior_config["target_similar1"]]
     suffix_manager = SuffixManagerMulTarget(
         tokenizer=tokenizer,
         conv_template=conv_template,
