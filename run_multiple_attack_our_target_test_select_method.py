@@ -85,16 +85,17 @@ def worker_task(task_list, resource_manager):
         model_path= r"D:\Model\Llama-2-7b-chat-hf"
         # model_path = "/home/liyubo/Model/Llama-2-7b-chat-hf"
 
+        run_single_process_select_method(behavior_id=task, device=card.id, output_path=output_path,
+                                         defense=defense, behaviors_config=behaviors_config, num_steps=num_steps,
+                                         batch_size=batch_size, loss_type="cross_entropy",
+                                         model_path=model_path,
+                                         use_weighted_sample="True")
         run_single_process_select_method(behavior_id = task, device = card.id, output_path = output_path,
                                          defense = defense,behaviors_config = behaviors_config, num_steps = num_steps,
                                          batch_size=batch_size,loss_type="cross_entropy",
                                          model_path=model_path)
 
-        run_single_process_select_method(behavior_id=task, device=card.id, output_path=output_path,
-                                         defense=defense, behaviors_config=behaviors_config, num_steps=num_steps,
-                                         batch_size=batch_size, loss_type="cross_entropy",
-                                         model_path=model_path,
-                                         use_weighted_sample = "True")
+
 
 
         resource_manager.release_card(card)

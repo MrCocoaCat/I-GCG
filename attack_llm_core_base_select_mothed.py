@@ -28,7 +28,7 @@ sys.path.append(os.path.abspath(repo_root))
 
 from llm_attacks.minimal_gcg.opt_utils import (
     token_gradients, sample_control, get_logits, generate,
-    load_model_and_tokenizer, get_filtered_cands,get_embedding_matrix,get_embeddings,sample_control_weighted
+    load_model_and_tokenizer, get_filtered_cands,get_embedding_matrix,get_embeddings
 )
 from llm_attacks.minimal_gcg.string_utils import SuffixManager, load_conversation_template
 from llm_attacks import get_nonascii_toks
@@ -119,13 +119,13 @@ class SuffixManagerMulTarget:
             # ===================== 调试打印 =====================
             target_len = len(toks[_target_slice])
             loss_len = len(toks[_loss_slice])
-            print("\n===== [get_mul_prompt] 切片长度检查 =====")
-            print(f"target_slice: {_target_slice} | 长度: {target_len}")
-            print(f"loss_slice  : {_loss_slice}   | 长度: {loss_len}")
-            print(f"❌ 长度是否一致? {target_len == loss_len}")
-            print(f"目标文本: {repr(self.tokenizer.decode(toks[_target_slice], skip_special_tokens=True))}")
-            print(f"loss对应预测位置文本: {repr(self.tokenizer.decode(toks[_loss_slice], skip_special_tokens=True))}")
-            print("=" * 60)
+            # print("\n===== [get_mul_prompt] 切片长度检查 =====")
+            # print(f"target_slice: {_target_slice} | 长度: {target_len}")
+            # print(f"loss_slice  : {_loss_slice}   | 长度: {loss_len}")
+            # print(f"❌ 长度是否一致? {target_len == loss_len}")
+            # print(f"目标文本: {repr(self.tokenizer.decode(toks[_target_slice], skip_special_tokens=True))}")
+            # print(f"loss对应预测位置文本: {repr(self.tokenizer.decode(toks[_loss_slice], skip_special_tokens=True))}")
+            # print("=" * 60)
         else:
             pass
         self.conv_template.messages = []
@@ -162,6 +162,82 @@ class SuffixManagerMulTarget:
         return self._target_slice if toks is None else toks[self._target_slice]
     def loss_slice(self, toks=None):
         return self._loss_slice if toks is None else toks[self._loss_slice]
+
+
+
+
+# ===================== 自适应TopK加权采样 =====================
+def sample_control_weighted(control_toks, grad, batch_size, topk=128, temp=1.0, not_allowed_tokens=None):
+    # 自适应TopK（根据batch自动调整，避免重复）
+    adaptive_topk = max(topk, batch_size * 2, 32)
+    adaptive_topk = topk
+    if not_allowed_tokens is not None:
+        grad[:, not_allowed_tokens.to(grad.device)] = float('inf')
+
+    topk_result = (-grad).topk(adaptive_topk, dim=1)
+    top_indices = topk_result.indices
+    topk_values = topk_result.values
+
+    control_toks = control_toks.to(grad.device)
+    original_control_toks = control_toks.repeat(batch_size, 1)
+
+
+
+    new_token_pos = torch.arange(
+        0, len(control_toks), len(control_toks) / batch_size,
+        device=grad.device
+    ).type(torch.int64)
+
+    selected_topk_values = torch.index_select(topk_values, dim=0, index=new_token_pos)
+    probs = torch.softmax(selected_topk_values / temp, dim=-1)
+    # idx = torch.multinomial(probs, num_samples=1, replacement=True)
+
+    # ===================== ✅ 逐一生成 + 检查重复 + 重复后移 =====================
+    generated = set()  # 记录已经生成的句子
+    idx_list = []
+
+    for i in range(batch_size):
+        # 当前要替换的位置
+        pos = new_token_pos[i]
+        # 当前概率
+        p = probs[i]
+
+        # 采样一个 index
+        idx = torch.multinomial(p, 1).item()
+
+        # 🔥 关键：如果重复，就一直往后移一位，直到不重复
+        while True:
+            # 取出 token
+            token = top_indices[pos, idx]
+            # 复制原始句子，替换当前位置
+            seq = original_control_toks[i].clone()
+            seq[pos] = token
+            # 转成可哈希的 key
+            key = tuple(seq.cpu().numpy())
+
+            if key not in generated:
+                generated.add(key)
+                idx_list.append(idx)
+                break
+
+            # 重复了 → 后移一个 token
+            idx = (idx + 1) % adaptive_topk
+
+    # 🔥【唯一修复】这里把 shape 变成 [batch, 1]
+    idx = torch.tensor(idx_list, device=grad.device).unsqueeze(1)
+    # ==========================================================================
+
+    selected_topk = torch.index_select(top_indices, dim=0, index=new_token_pos)
+    new_token_val = torch.gather(input=selected_topk, dim=1, index=idx)
+
+    new_token_pos_u = new_token_pos.unsqueeze(-1)
+    new_control_toks = original_control_toks.scatter_(dim=1, index=new_token_pos_u, src=new_token_val)
+
+
+    unique_count = len(torch.unique(new_control_toks, dim=0))
+    print(f"生成了 {batch_size} 条，不重复数量：{unique_count}")
+
+    return new_control_toks, idx, adaptive_topk
 
 # 核心：适配所有主流LLM的嵌入层获取逻辑
 def get_model_embedding_layer(model):
@@ -366,9 +442,37 @@ def compute_both_scores(model, tokenizer, logits, ids, target_slice, args,test_p
     loss_re = crit(logits[:, loss_slice, :].transpose(1, 2), target_ids)
     losses = loss_re.mean(dim=-1)
 
-    best_loss = losses.min()
-    global_worst_loss = losses.max()
+    #best_loss = losses.min()
+    # global_worst_loss = losses.max()
 
+    # ===================== 🔥 新增：全局拒绝词惩罚 =====================
+    # 你要惩罚的拒绝词（可无限加）
+    refusal_tokens = [
+        tokenizer.encode("sorry", add_special_tokens=False)[0],
+        tokenizer.encode("unfortunately", add_special_tokens=False)[0],
+        tokenizer.encode("cannot", add_special_tokens=False)[0],
+        tokenizer.encode("can't", add_special_tokens=False)[0],
+    ]
+
+    # 取出所有预测位置的概率分布
+    logits_pred = logits[:, loss_slice, :]  # [batch, num_target_tokens, vocab]
+    probs = torch.softmax(logits_pred, dim=-1)
+
+    # 计算所有拒绝词在【所有位置】的概率平均值
+    refusal_probs = []
+    for tok_id in refusal_tokens:
+        refusal_probs.append(probs[:, :, tok_id])
+    refusal_probs = torch.stack(refusal_probs, dim=-1)  # [batch, seq_len, num_refusal]
+
+    # 计算：每个样本 -> 所有拒绝词 + 所有位置 的平均概率
+    mean_refusal_prob = refusal_probs.mean(dim=[1, 2])  # [batch] ✅ 正确维度
+
+    # 惩罚：概率越高，惩罚越大
+
+    refusal_penalty = 0.5 * mean_refusal_prob
+
+    # 最终损失 = 原损失 + 拒绝惩罚
+    contrast_losses = losses + refusal_penalty
 
     # --------------------- 2. 余弦相似度 ---------------------
     embedding_layer = get_model_embedding_layer(model)
@@ -418,48 +522,18 @@ def compute_both_scores(model, tokenizer, logits, ids, target_slice, args,test_p
         sim = F.cosine_similarity(true_ids_embedding[i], pred_ids_embedding, dim=-1).mean().item()
         cosine_scores.append(sim)
         # ===================== 🔥 对比学习：正样本CE + 负样本CE =====================
-        # 1. 当前样本的正损失
-        pos_loss = losses[i]
-        # 2. 计算负样本损失
-        neg_logits = logits[i, neg_slice, :]
-        all_neg_losses = []
-        for ni in neg_id_list:
-            # 安全截断
-            nl = min(neg_logits.shape[0], ni.shape[0])
-            nl_loss = F.cross_entropy(neg_logits[:nl], ni[:nl])
-            all_neg_losses.append(nl_loss)
-        avg_neg_loss = torch.stack(all_neg_losses).mean()
-        # 🔥 对比损失 = 正样本CE + weight * exp(-负样本CE)
-        # contrast_loss = -torch.log( torch.exp(pos_loss) / (torch.exp(pos_loss) + torch.exp(avg_neg_loss)) )
-
-        pos_score = torch.exp(-pos_loss)
-        neg_score = torch.exp(-global_worst_loss)
-        contrast_loss = -torch.log(pos_score / (pos_score + neg_score))
-
-        #contrast_loss = pos_loss + args.neg_weight * torch.exp(-avg_neg_loss)
-
-        contrast_scores.append(contrast_loss.item())
-
-        # 🔥 论文级对比损失，一定有效
-
-
-    # ===================== 选择最优 =====================
-    # ========== 选出 相似度最高 的候选 ==========
+    # 交叉熵
+    best_ce_id = losses.argmin()
+    ce_loss = losses[best_ce_id].item()
+    # 余弦相似度
     cosine_scores = torch.tensor(cosine_scores, device=device)
     best_cos_id = cosine_scores.argmax()
     best_cos_sim = cosine_scores[best_cos_id].item()
+    #
+    best_contrast_id = contrast_losses.argmin()
+    contrast_loss = contrast_losses[best_contrast_id].item()
 
-    best_ce_id = losses.argmin()
-    ce_loss = losses[best_ce_id].item()
-
-    contrast_scores = torch.tensor(contrast_scores, device=device)
-    best_contrast_id = contrast_scores.argmin()  # 损失越小越好
-    contrast_loss = contrast_scores[best_contrast_id].item()
-
-   # print(f"CE: {losses}, \n contrast_scores: {contrast_scores}, \ncosine_scores: {cosine_scores}")
-    #print(f" 🔮best_cos_id 选择  {best_cos_id}  完整输出：{full_pred_str_list[best_cos_id]!r}")
-    #print(f" 🔮best_ce_id  选择  {best_ce_id}  完整输出：{full_pred_str_list[best_ce_id]!r}")
-    return best_ce_id.item(), ce_loss, best_cos_id.item(), best_cos_sim ,best_contrast_id.item(),contrast_loss
+    return best_ce_id.item(), ce_loss, best_cos_id.item(), best_cos_sim ,best_contrast_id, contrast_loss
 
 # ===================== 修复：PPL 筛选函数（必须返回 ids） =====================
 def get_logits_ppl(model, tokenizer, input_ids, control_slice, test_controls, batch_size):
@@ -630,9 +704,8 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
                 adv_suffix_tokens = input_ids[control_slice].to(device)
                 # 加权采样开关
                 if args.use_weighted_sample:
-                    new_adv_suffix_toks = sample_control_weighted(
+                    new_adv_suffix_toks, _, _ = sample_control_weighted(
                         adv_suffix_tokens, coordinate_grad,
-                        model = model,
                         batch_size=batch_size, topk=top_k,
                         not_allowed_tokens=not_allowed_tokens
                     )
@@ -791,6 +864,8 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
         "best_adv_suffix": adv_suffix,
         "best_cross_entropy": best_ce_loss,
         "best_cosine_sim": best_cos_sim,
+        "gen_str": gen_str,
+        "target": suffix_manager.target,
         "total_steps": len(log_dict)
     }
     with open(submission_json_file, 'w', encoding='utf-8') as f:
