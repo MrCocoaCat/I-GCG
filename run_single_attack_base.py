@@ -49,7 +49,8 @@ def run_single_process_select_method(behavior_id: int, device: int,
                                      use_ppl_filter = "False",
                                      use_multi_target = "False",
                                      use_contrast_loss = "False",
-                                     use_weighted_sample = "False"):
+                                     use_weighted_sample = "False",
+                                     target_similar_key="target_similar1"):
     command = ["python", "-u" ,"attack_llm_core_base_select_mothed.py",
                "--id", str(behavior_id),
                "--device", str(device),
@@ -65,7 +66,8 @@ def run_single_process_select_method(behavior_id: int, device: int,
                "--use_ppl_filter", use_ppl_filter,
                "--use_multi_target", use_multi_target,
                "--use_contrast_loss", use_contrast_loss,
-               "--use_weighted_sample", use_weighted_sample]
+               "--use_weighted_sample", use_weighted_sample,
+               "--target_similar_key", target_similar_key]
 
     process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding='utf-8')
 

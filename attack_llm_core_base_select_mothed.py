@@ -163,48 +163,70 @@ class SuffixManagerMulTarget:
     def loss_slice(self, toks=None):
         return self._loss_slice if toks is None else toks[self._loss_slice]
 
-
-
-
 # ===================== 自适应TopK加权采样 =====================
 def sample_control_weighted(control_toks, grad, batch_size, topk=128, temp=1.0, not_allowed_tokens=None):
     # 自适应TopK（根据batch自动调整，避免重复）
-    adaptive_topk = max(topk, batch_size * 2, 32)
+    # adaptive_topk = max(topk, batch_size * 2, 32)
     adaptive_topk = topk
     if not_allowed_tokens is not None:
         grad[:, not_allowed_tokens.to(grad.device)] = float('inf')
 
+    # 新增：加入核心拒绝词梯度屏蔽（与之前整理的单个拒绝词对应，彻底消除拒绝噪声）
+    refusal_tokens = [
+        # 歉意类
+        tokenizer.encode("sorry", add_special_tokens=False)[0],
+        tokenizer.encode("apologize", add_special_tokens=False)[0],
+        tokenizer.encode("apologies", add_special_tokens=False)[0],
+        # 能力限制类
+        tokenizer.encode("cannot", add_special_tokens=False)[0],
+        tokenizer.encode("can't", add_special_tokens=False)[0],
+        tokenizer.encode("not", add_special_tokens=False)[0],
+        tokenizer.encode("unable", add_special_tokens=False)[0],
+        tokenizer.encode("capable", add_special_tokens=False)[0],
+        # 伦理/法律禁忌类
+        tokenizer.encode("illegal", add_special_tokens=False)[0],
+        tokenizer.encode("unethical", add_special_tokens=False)[0],
+        tokenizer.encode("ethical", add_special_tokens=False)[0],
+        tokenizer.encode("legal", add_special_tokens=False)[0],
+        # 其他拒绝/限制类
+        tokenizer.encode("must", add_special_tokens=False)[0],
+        tokenizer.encode("never", add_special_tokens=False)[0],
+        tokenizer.encode("responsible", add_special_tokens=False)[0]
+    ]
+    refusal_tokens = torch.tensor(refusal_tokens, device=grad.device)
+    grad[:, refusal_tokens] = float('inf')
+
+    # L2归一化，让梯度幅度更平稳，减少噪声干扰
+    grad = grad / grad.norm(dim=-1, keepdim=True)
     topk_result = (-grad).topk(adaptive_topk, dim=1)
     top_indices = topk_result.indices
     topk_values = topk_result.values
 
+
     control_toks = control_toks.to(grad.device)
     original_control_toks = control_toks.repeat(batch_size, 1)
-
-
-
     new_token_pos = torch.arange(
         0, len(control_toks), len(control_toks) / batch_size,
         device=grad.device
     ).type(torch.int64)
-
     selected_topk_values = torch.index_select(topk_values, dim=0, index=new_token_pos)
-    probs = torch.softmax(selected_topk_values / temp, dim=-1)
-    # idx = torch.multinomial(probs, num_samples=1, replacement=True)
+    # probs = torch.softmax(selected_topk_values / temp, dim=-1)
 
+    logits = selected_topk_values / temp
+    logits = logits - logits.max(dim=-1, keepdim=True).values
+    probs = torch.softmax(logits, dim=-1)
+
+    # idx = torch.multinomial(probs, num_samples=1, replacement=True)
     # ===================== ✅ 逐一生成 + 检查重复 + 重复后移 =====================
     generated = set()  # 记录已经生成的句子
     idx_list = []
-
     for i in range(batch_size):
         # 当前要替换的位置
         pos = new_token_pos[i]
         # 当前概率
         p = probs[i]
-
         # 采样一个 index
         idx = torch.multinomial(p, 1).item()
-
         # 🔥 关键：如果重复，就一直往后移一位，直到不重复
         while True:
             # 取出 token
@@ -214,30 +236,22 @@ def sample_control_weighted(control_toks, grad, batch_size, topk=128, temp=1.0, 
             seq[pos] = token
             # 转成可哈希的 key
             key = tuple(seq.cpu().numpy())
-
             if key not in generated:
                 generated.add(key)
                 idx_list.append(idx)
                 break
-
             # 重复了 → 后移一个 token
             idx = (idx + 1) % adaptive_topk
 
     # 🔥【唯一修复】这里把 shape 变成 [batch, 1]
     idx = torch.tensor(idx_list, device=grad.device).unsqueeze(1)
     # ==========================================================================
-
     selected_topk = torch.index_select(top_indices, dim=0, index=new_token_pos)
     new_token_val = torch.gather(input=selected_topk, dim=1, index=idx)
-
     new_token_pos_u = new_token_pos.unsqueeze(-1)
     new_control_toks = original_control_toks.scatter_(dim=1, index=new_token_pos_u, src=new_token_val)
-
-
-    unique_count = len(torch.unique(new_control_toks, dim=0))
-    print(f"生成了 {batch_size} 条，不重复数量：{unique_count}")
-
     return new_control_toks, idx, adaptive_topk
+
 
 # 核心：适配所有主流LLM的嵌入层获取逻辑
 def get_model_embedding_layer(model):
@@ -472,8 +486,9 @@ def compute_both_scores(model, tokenizer, logits, ids, target_slice, args,test_p
     refusal_penalty = 0.5 * mean_refusal_prob
 
     # 最终损失 = 原损失 + 拒绝惩罚
-    contrast_losses = losses + refusal_penalty
+    #contrast_losses = losses + refusal_penalty
 
+    contrast_losses = losses
     # --------------------- 2. 余弦相似度 ---------------------
     embedding_layer = get_model_embedding_layer(model)
     true_ids_embedding = embedding_layer(target_ids)      # ✅ 只获取一次，在循环外
@@ -630,6 +645,7 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
     not_allowed_tokens = None if allow_non_ascii else get_nonascii_toks(tokenizer)
     adv_suffix = adv_string_init
     log_dict = []
+    all_candidates_log = []
 
     best_ce_loss = float('inf')
     best_cos_sim = -float('inf')
@@ -644,8 +660,20 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
     mu = "multi" if args.use_multi_target else ""
     con_loss = "contrast" if args.use_contrast_loss else ""
     sample_method = "weighted_sample" if args.use_weighted_sample else ""
-    submission_json_file = pathlib.Path(f'{args.output_path}/submission/{mu}{args.loss_type}{ppl_suffix}_{args.str_init}_{sample_method}_{args.id}.json')
-    log_json_file = pathlib.Path(f'{args.output_path}/log/{mu}_{con_loss}_{args.loss_type}_{ppl_suffix}_{args.str_init}_{sample_method}_{args.id}.json')
+    #submission_json_file = pathlib.Path(f'{args.output_path}/submission/{mu}{args.loss_type}{ppl_suffix}_{args.str_init}_{sample_method}_{args.id}.json')
+    #log_json_file = pathlib.Path(f'{args.output_path}/log/{mu}_{con_loss}_{args.loss_type}_{ppl_suffix}_{args.str_init}_{sample_method}_{args.id}.json')
+    #candidates_file_path = pathlib.Path( f'{args.output_path}/candidates/{mu}_{con_loss}_{args.loss_type}_{ppl_suffix}_{args.str_init}_{sample_method}_{args.id}.json')
+
+    submission_json_file = pathlib.Path(
+        f'{args.output_path}/submission/{mu}{args.loss_type}{ppl_suffix}_{args.str_init}_{sample_method}_{args.target_similar_key}_{args.id}.json')
+    log_json_file = pathlib.Path(
+        f'{args.output_path}/log/{mu}_{con_loss}_{args.loss_type}_{ppl_suffix}_{args.str_init}_{sample_method}_{args.target_similar_key}_{args.id}.json')
+    candidates_file_path = pathlib.Path(
+        f'{args.output_path}/candidates/{mu}_{con_loss}_{args.loss_type}_{ppl_suffix}_{args.str_init}_{sample_method}_{args.target_similar_key}_{args.id}.json')
+
+    if not candidates_file_path.parent.exists():
+        os.makedirs(candidates_file_path.parent, exist_ok=True)
+    candidates_f = open(candidates_file_path, 'w', encoding='utf-8')
     for f in [submission_json_file, log_json_file]:
         if not f.parent.exists():
             os.makedirs(f.parent, exist_ok=True)
@@ -715,11 +743,15 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
                         batch_size=batch_size, topk=top_k,
                         not_allowed_tokens=not_allowed_tokens
                     )
-                # new_adv_suffix_toks = sample_control(
-                #     adv_suffix_tokens, coordinate_grad,
-                #     batch_size=batch_size, topk=top_k,
-                #     not_allowed_tokens=not_allowed_tokens
-                # )
+                unique_count = len(torch.unique(new_adv_suffix_toks, dim=0))
+                print(f"生成了 {batch_size} 条，不重复数量：{unique_count}")
+
+                # 实时写入当前 step 所有原始候选（未过滤）
+                raw_candidates = tokenizer.batch_decode(new_adv_suffix_toks, skip_special_tokens=True)
+                json_line = json.dumps({"step": i, "raw_batch_candidates": raw_candidates}, ensure_ascii=False)
+                candidates_f.write(json_line + "\n")
+                candidates_f.flush()  # 立即写入磁盘，不缓存
+
                 new_adv_suffix = get_filtered_cands(
                     tokenizer,
                     new_adv_suffix_toks,
@@ -826,6 +858,7 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
                     "target": suffix_manager.target,
                     "target_best": best_target_str,
                     "current_target_index": str(current_target_index),
+                    "simple_unique_count":unique_count
                 }
                 log_dict.append(log_entry)
 
@@ -870,6 +903,12 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
     }
     with open(submission_json_file, 'w', encoding='utf-8') as f:
         json.dump(best_result, f, ensure_ascii=False, indent=2)
+
+    candidates_f.close()
+    # =====================================================
+
+    with open(log_json_file, 'w', encoding='utf-8') as f:
+        json.dump(log_dict, f, ensure_ascii=False, indent=2)
 
     return log_dict
 
@@ -916,6 +955,12 @@ if __name__ == '__main__':
     parser.add_argument('--neg_weight', type=float, default=500.0, help="负样本对比强度")
     parser.add_argument('--use_weighted_sample', type=lambda x: x.lower() == 'true', default=False)
 
+    parser.add_argument('--target_similar_key', type=str, default="target_similar1",
+                        help="配置文件中目标相似列表的key（默认target_similar1，可修改为其他key区分不同相似列表）")
+
+
+
+
     args = parser.parse_args()
     set_seed(42)
     device = f"cuda:{args.device}" if torch.cuda.is_available() else "cpu"
@@ -938,7 +983,8 @@ if __name__ == '__main__':
     #     tokenizer=tokenizer, conv_template=conv_template,
     #     instruction=user_prompt, target=target, adv_string=adv_string_init
     # )
-    target_sim_list = [item["text"] for item in behavior_config["target_similar1"]]
+    # target_sim_list = [item["text"] for item in behavior_config["target_similar1"]]
+    target_sim_list = [item["text"] for item in behavior_config[args.target_similar_key]]
     suffix_manager = SuffixManagerMulTarget(
         tokenizer=tokenizer,
         conv_template=conv_template,
@@ -966,6 +1012,7 @@ if __name__ == '__main__':
     print("               🚀 Experiment Arguments")
     print("=" * 50)
 
+    # 在arg_items列表中添加一行，打印target_similar_key参数（补全完整上下文，可直接复制）
     arg_items = [
         ("Model Path", args.model_path),
         ("Device", f"cuda:{args.device}"),
@@ -983,10 +1030,12 @@ if __name__ == '__main__':
         ("Use Multi Target", args.use_multi_target),
         ("Use Contrast Loss", args.use_contrast_loss),
         ("Neg Weight", args.neg_weight),
+        ("Target Similar Key", args.target_similar_key),
     ]
 
     for k, v in arg_items:
         print(f"{k:<22} : {v}")
+
 
     print("=" * 50)
    # print(args)

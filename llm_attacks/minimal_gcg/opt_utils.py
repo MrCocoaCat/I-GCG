@@ -91,7 +91,7 @@ def token_gradients(model, input_ids, input_slice, target_slice, loss_slice,toke
     target_str = tokenizer.decode(targets, skip_special_tokens=True)
     pred_tokens = outputs_targets_logits.argmax(dim=-1)
     pred_str = tokenizer.decode(pred_tokens, skip_special_tokens=True)
-    print(f"🎯 ，上次优化的结果进入循环，用于初始化onehot 矩阵，这是数据集中得数据，TARGET: {repr(target_str)}")
+    print(f"🎯 上次优化的结果，   TARGET: {repr(target_str)}")
     print(f"🤖 这是模型输出得结果，PREDIC: {repr(pred_str)}")
 
     loss = nn.CrossEntropyLoss()(outputs_targets_logits, targets)

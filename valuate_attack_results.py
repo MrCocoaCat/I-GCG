@@ -4,7 +4,7 @@ import argparse
 
 # ===================== 1. 配置解析 =====================
 parser = argparse.ArgumentParser(description="GCG 攻击结果自动评估脚本")
-parser.add_argument('--output_path', type=str, default=r'D:\GitHub\I-GCG\test_select_method\ours\20260415-014710-MulMethodSucess')
+parser.add_argument('--output_path', type=str, default=r'D:\GitHub\I-GCG\test_select_method\ours\20260421-232148')
 parser.add_argument('--batch_size', type=int, default=6)
 parser.add_argument('--loss_type', type=str, default="cross_entropy", choices=["cross_entropy", "cosine"])
 parser.add_argument('--use_ppl_filter', type=lambda x: x.lower() == 'true', default=False)
@@ -92,28 +92,32 @@ def analyze_results(file_prefix, method_name, common_ids):
 # ===================== 3. 主函数 =====================
 def main():
     print("=" * 70)
-    print("GCG 对抗攻击结果自动评估脚本（统一样本公平对比）")
+    print("GCG 对抗攻击结果自动评估脚本")
     print("=" * 70)
 
     ppl_suffix = "ppl" if args.use_ppl_filter else ""
     log_dir = pathlib.Path(args.output_path) / "log"
 
     method_configs = [
-        {"name": "单目标 - No Contrast Loss", "con_loss": "", "mu": "", "loss_type": "cross_entropy" ,  "    sample_method" :""},
-        {"name": "多目标 - No Contrast Loss", "con_loss": "", "mu": "multi", "loss_type": "cross_entropy", "sample_method": ""}
+        {"name": "随机", "con_loss": "", "mu": "", "loss_type": "cross_entropy" ,  "sample_method" :""},
+        {"name": "权重", "con_loss": "", "mu": "", "loss_type": "cross_entropy",   "sample_method": "weighted_sample"}
     ]
+# __cross_entropy__adv_init_suffix__1.json
 
+    # D:\GitHub\I-GCG\test_select_method\ours\20260419-213411\log
     # ============== 关键：获取所有方法共同存在的样本 ID ==============
     id_sets = []
     for cfg in method_configs:
-        file_prefix = log_dir / f'{cfg["mu"]}_{cfg["con_loss"]}_{cfg["loss_type"]}_{ppl_suffix}_{args.str_init}'
+        file_prefix = log_dir / f'{cfg["mu"]}_{cfg["con_loss"]}_{cfg["loss_type"]}_{ppl_suffix}_{args.str_init}_{cfg["sample_method"]}'
+       # log_json_file = {mu}_{con_loss}_{args.loss_type}_{ppl_suffix}_{args.str_init}_{sample_method}_{args.id}.json')
         ids = set()
         for run_id in range(1, 50):
+
             f_path = pathlib.Path(f"{file_prefix}_{run_id}.json")
             if f_path.exists():
                 ids.add(run_id)
-           # else:
-               # print(f_path)
+            else:
+               print(f_path)
         id_sets.append(ids)
 
     common_ids = sorted(set.intersection(*id_sets))
@@ -123,7 +127,7 @@ def main():
     # ============== 统一用 common_ids 评估 ==============
     results = []
     for cfg in method_configs:
-        file_prefix = log_dir / f'{cfg["mu"]}_{cfg["con_loss"]}_{args.loss_type}_{ppl_suffix}_{args.str_init}'
+        file_prefix = log_dir / f'{cfg["mu"]}_{cfg["con_loss"]}_{cfg["loss_type"]}_{ppl_suffix}_{args.str_init}_{cfg["sample_method"]}'
         res = analyze_results(file_prefix, cfg["name"], common_ids)
         results.append(res)
 

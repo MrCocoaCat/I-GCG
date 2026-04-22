@@ -21,7 +21,9 @@ device_list = [0]
 defense=args.defense
 timestamp = (datetime.datetime.now() + datetime.timedelta(hours=8)).strftime("%Y%m%d-%H%M%S")
 # 拼接最终输出路径：根目录(Our_GCG_target_len_20) + 用户指定路径 + 时间戳
-output_path=os.path.join("test_select_method",args.output_path)
+#model_path = r"D:\Model\Llama-2-7b-chat-hf"
+model_path = r"D:\Model\vicuna-7b-v1.3"
+output_path=os.path.join("test_select_vicuna_method",args.output_path)
 output_path=os.path.join(output_path,str(timestamp))
 
 behaviors_config="adv_similar.json"
@@ -82,18 +84,24 @@ def worker_task(task_list, resource_manager):
         # 实际执行的逻辑，其他的代码都是并行处理逻辑
         num_steps = 2
         batch_size = 2
-        model_path= r"D:\Model\Llama-2-7b-chat-hf"
+
         # model_path = "/home/liyubo/Model/Llama-2-7b-chat-hf"
 
         run_single_process_select_method(behavior_id=task, device=card.id, output_path=output_path,
                                          defense=defense, behaviors_config=behaviors_config, num_steps=num_steps,
                                          batch_size=batch_size, loss_type="cross_entropy",
-                                         model_path=model_path,
-                                         use_weighted_sample="True")
+                                         model_path=model_path)
         run_single_process_select_method(behavior_id = task, device = card.id, output_path = output_path,
                                          defense = defense,behaviors_config = behaviors_config, num_steps = num_steps,
                                          batch_size=batch_size,loss_type="cross_entropy",
-                                         model_path=model_path)
+                                         model_path=model_path,use_multi_target="True",
+                                         target_similar_key = "target_similar1")
+
+        run_single_process_select_method(behavior_id=task, device=card.id, output_path=output_path,
+                                         defense=defense, behaviors_config=behaviors_config, num_steps=num_steps,
+                                         batch_size=batch_size, loss_type="cross_entropy",
+                                         model_path=model_path, use_multi_target="True",
+                                         target_similar_key="target_similar2")
 
 
 

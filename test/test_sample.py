@@ -1,6 +1,7 @@
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
+from attack_llm_core_base_select_mothed import sample_control_weighted
 
 # ===================== 随机采样 —— 完全不动 =====================
 def sample_control(control_toks, grad, batch_size, topk=128, temp=1, not_allowed_tokens=None):
@@ -30,78 +31,7 @@ def sample_control(control_toks, grad, batch_size, topk=128, temp=1, not_allowed
     return rand_idx, new_control_toks
 
 
-# ===================== 自适应TopK加权采样 =====================
-def sample_control_weighted(control_toks, grad, batch_size, topk=128, temp=1.0, not_allowed_tokens=None):
-    # 自适应TopK（根据batch自动调整，避免重复）
-    adaptive_topk = max(topk, batch_size * 2, 32)
-    adaptive_topk = topk
-    if not_allowed_tokens is not None:
-        grad[:, not_allowed_tokens.to(grad.device)] = float('inf')
 
-    topk_result = (-grad).topk(adaptive_topk, dim=1)
-    top_indices = topk_result.indices
-    topk_values = topk_result.values
-
-    control_toks = control_toks.to(grad.device)
-    original_control_toks = control_toks.repeat(batch_size, 1)
-
-
-
-    new_token_pos = torch.arange(
-        0, len(control_toks), len(control_toks) / batch_size,
-        device=grad.device
-    ).type(torch.int64)
-
-    selected_topk_values = torch.index_select(topk_values, dim=0, index=new_token_pos)
-    probs = torch.softmax(selected_topk_values / temp, dim=-1)
-    # idx = torch.multinomial(probs, num_samples=1, replacement=True)
-
-    # ===================== ✅ 逐一生成 + 检查重复 + 重复后移 =====================
-    generated = set()  # 记录已经生成的句子
-    idx_list = []
-
-    for i in range(batch_size):
-        # 当前要替换的位置
-        pos = new_token_pos[i]
-        # 当前概率
-        p = probs[i]
-
-        # 采样一个 index
-        idx = torch.multinomial(p, 1).item()
-
-        # 🔥 关键：如果重复，就一直往后移一位，直到不重复
-        while True:
-            # 取出 token
-            token = top_indices[pos, idx]
-            # 复制原始句子，替换当前位置
-            seq = original_control_toks[i].clone()
-            seq[pos] = token
-            # 转成可哈希的 key
-            key = tuple(seq.cpu().numpy())
-
-            if key not in generated:
-                generated.add(key)
-                idx_list.append(idx)
-                break
-
-            # 重复了 → 后移一个 token
-            idx = (idx + 1) % adaptive_topk
-
-    # 🔥【唯一修复】这里把 shape 变成 [batch, 1]
-    idx = torch.tensor(idx_list, device=grad.device).unsqueeze(1)
-    # ==========================================================================
-
-    selected_topk = torch.index_select(top_indices, dim=0, index=new_token_pos)
-    new_token_val = torch.gather(input=selected_topk, dim=1, index=idx)
-
-    new_token_pos_u = new_token_pos.unsqueeze(-1)
-    new_control_toks = original_control_toks.scatter_(dim=1, index=new_token_pos_u, src=new_token_val)
-
-
-    unique_count = len(torch.unique(new_control_toks, dim=0))
-    print(f"生成了 {batch_size} 条，不重复数量：{unique_count}")
-
-    return new_control_toks, idx, adaptive_topk
 
 
 # ===================== 测试输入 =====================
