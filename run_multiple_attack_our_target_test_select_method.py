@@ -23,7 +23,11 @@ timestamp = (datetime.datetime.now() + datetime.timedelta(hours=8)).strftime("%Y
 # 拼接最终输出路径：根目录(Our_GCG_target_len_20) + 用户指定路径 + 时间戳
 #model_path = r"D:\Model\Llama-2-7b-chat-hf"
 model_path = r"D:\Model\vicuna-7b-v1.3"
-output_path=os.path.join("test_select_vicuna_method",args.output_path)
+
+# 🔥 自动提取模型文件夹名称（核心）
+model_name = os.path.basename(model_path)
+# 🔥 拼接你要的输出路径（完全不写死）
+output_path = os.path.join(f"{model_name}_result", args.output_path)
 output_path=os.path.join(output_path,str(timestamp))
 
 behaviors_config="adv_similar.json"

@@ -270,44 +270,6 @@ def sample_control(control_toks, grad, batch_size, topk=256, temp=1, not_allowed
 
     return new_control_toks
 
-#
-# def sample_control_weighted(control_toks, grad, model, batch_size, topk=256, temp=1, not_allowed_tokens=None, lambda_emb=0):
-#     if not_allowed_tokens is not None:
-#         grad[:, not_allowed_tokens.to(grad.device)] = float('inf')
-#
-#     # 分数
-#     grad_score = -grad
-#     emb = model.get_input_embeddings().weight.data
-#     control_emb = emb[control_toks]
-#     norm_c = control_emb / control_emb.norm(dim=-1, keepdim=True)
-#     norm_e = emb / emb.norm(dim=-1, keepdim=True)
-#     sim = norm_c @ norm_e.T
-#     dist = 1 - sim
-#     score = grad_score - lambda_emb * dist
-#
-#     # TOPK
-#     topk_vals, top_indices = score.topk(topk, dim=1)
-#
-#     # 批次
-#     control_toks = control_toks.to(grad.device)
-#     original_control_toks = control_toks.repeat(batch_size, 1)
-#     new_token_pos = torch.arange(0, len(control_toks), len(control_toks)/batch_size, device=grad.device).long()
-#
-#     # ✅ 关键：一次性 batch 加权采样，和原版完全同结构
-#     selected_topk_vals = topk_vals[new_token_pos]
-#     probs = torch.softmax(selected_topk_vals / temp, dim=-1)
-#     idx = torch.multinomial(probs, num_samples=1)
-#
-#     # Gather
-#     selected_topk_indices = top_indices[new_token_pos]
-#     new_token_val = torch.gather(selected_topk_indices, 1, idx)
-#
-#     # Scatter
-#     new_token_pos_u = new_token_pos.unsqueeze(-1)
-#     new_control_toks = original_control_toks.scatter_(1, new_token_pos_u, new_token_val)
-#
-#     return new_control_toks
-
 
 def sample_control_ppl(control_toks, grad, batch_size, topk=256, temp=1, not_allowed_tokens=None, n_replace=1):
     if not_allowed_tokens is not None:
@@ -342,7 +304,6 @@ def sample_control_ppl(control_toks, grad, batch_size, topk=256, temp=1, not_all
 def get_filtered_cands(tokenizer, control_cand, filter_cand=True, curr_control=None):
     """
         过滤控制token候选集，确保解码后的字符串有效且长度匹配。
-
         @par tokenizer: transformers.PreTrainedTokenizer
             用于token编解码的分词器
         @par control_cand: torch.Tensor

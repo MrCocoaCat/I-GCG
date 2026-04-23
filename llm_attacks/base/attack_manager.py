@@ -67,7 +67,6 @@ def get_nonascii_toks(tokenizer, device='cpu'):
     for i in range(3, tokenizer.vocab_size):
         if not is_ascii(tokenizer.decode([i])):
             ascii_toks.append(i)
-    
     if tokenizer.bos_token_id is not None:
         ascii_toks.append(tokenizer.bos_token_id)
     if tokenizer.eos_token_id is not None:

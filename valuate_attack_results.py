@@ -4,7 +4,7 @@ import argparse
 
 # ===================== 1. 配置解析 =====================
 parser = argparse.ArgumentParser(description="GCG 攻击结果自动评估脚本")
-parser.add_argument('--output_path', type=str, default=r'D:\GitHub\I-GCG\test_select_method\ours\20260421-232148')
+parser.add_argument('--output_path', type=str, default=r'D:\GitHub\I-GCG\test_select_method\ours\20260423-042737')
 parser.add_argument('--batch_size', type=int, default=6)
 parser.add_argument('--loss_type', type=str, default="cross_entropy", choices=["cross_entropy", "cosine"])
 parser.add_argument('--use_ppl_filter', type=lambda x: x.lower() == 'true', default=False)
@@ -98,9 +98,14 @@ def main():
     ppl_suffix = "ppl" if args.use_ppl_filter else ""
     log_dir = pathlib.Path(args.output_path) / "log"
 
+    # ppl_suffix = "ppl" if args.use_ppl_filter else ""
+    #     mu = "multi" if args.use_multi_target else ""
+    #     con_loss = "contrast" if args.use_contrast_loss else ""
+    #     sample_method = "weighted_sample" if args.use_weighted_sample else ""
     method_configs = [
-        {"name": "随机", "con_loss": "", "mu": "", "loss_type": "cross_entropy" ,  "sample_method" :""},
-        {"name": "权重", "con_loss": "", "mu": "", "loss_type": "cross_entropy",   "sample_method": "weighted_sample"}
+        {"name": "随机", "con_loss": "", "mu": "",      "loss_type": "cross_entropy",   "sample_method": "", "target_similar_key":"target_similar1"},
+        {"name": "权重", "con_loss": "", "mu": "multi", "loss_type": "cross_entropy",   "sample_method": "", "target_similar_key":"target_similar1"},
+        {"name": "权重", "con_loss": "", "mu": "multi", "loss_type": "cross_entropy",   "sample_method": "", "target_similar_key":"target_similar2"}
     ]
 # __cross_entropy__adv_init_suffix__1.json
 
@@ -108,7 +113,8 @@ def main():
     # ============== 关键：获取所有方法共同存在的样本 ID ==============
     id_sets = []
     for cfg in method_configs:
-        file_prefix = log_dir / f'{cfg["mu"]}_{cfg["con_loss"]}_{cfg["loss_type"]}_{ppl_suffix}_{args.str_init}_{cfg["sample_method"]}'
+        log_json_file = log_dir / f'{cfg["mu"]}_{cfg["con_loss"]}_{cfg["loss_type"]}_{ppl_suffix}_{args.str_init}_{cfg["sample_method"]}_{cfg["target_similar_key"]}'
+        file_prefix =   log_dir / f'{cfg["mu"]}_{cfg["con_loss"]}_{cfg["loss_type"]}_{ppl_suffix}_{args.str_init}_{cfg["sample_method"]}_{cfg["target_similar_key"]}'
        # log_json_file = {mu}_{con_loss}_{args.loss_type}_{ppl_suffix}_{args.str_init}_{sample_method}_{args.id}.json')
         ids = set()
         for run_id in range(1, 50):
