@@ -8,3 +8,5 @@
 /imgs
 /test_select_method
 /test_select_vicuna_method/ours
+attack_llm_core_base_select_mothed.py
+/grad_logs

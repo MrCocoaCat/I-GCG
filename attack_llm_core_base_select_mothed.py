@@ -14,7 +14,6 @@ import time
 import traceback
 import linecache
 import numpy as np
-import torch
 import random
 
 
@@ -33,6 +32,13 @@ from llm_attacks.minimal_gcg.opt_utils import (
 from llm_attacks.minimal_gcg.string_utils import SuffixManager, load_conversation_template
 from llm_attacks import get_nonascii_toks
 
+# ===================== 全局配置（放在函数外面）=====================
+# 根目录
+GRAD_SAVE_ROOT = "./grad_logs"
+# 每次运行创建独立子文件夹（程序启动时创建一次）
+CURRENT_RUN_DIR = os.path.join(GRAD_SAVE_ROOT, time.strftime("%Y%m%d_%H%M%S"))
+os.makedirs(CURRENT_RUN_DIR, exist_ok=True)
+# ==================================================================
 
 
 class SuffixManagerMulTarget:
@@ -171,38 +177,37 @@ def sample_control_weighted(control_toks, grad, batch_size, topk=128, temp=1.0, 
     if not_allowed_tokens is not None:
         grad[:, not_allowed_tokens.to(grad.device)] = float('inf')
         # 🔥 8位日期 + 毫秒（完美可读性 + 永不重复）
-    os.makedirs("./grad_logs", exist_ok=True)
+        # 保存最原始梯度（自动进入本次运行的文件夹）
     timestamp = time.strftime("%Y%m%d_%H%M%S") + f"_{int(time.time() * 1000) % 1000}"
-    save_path = f"./grad_logs/grad_original_{timestamp}.pt"
-    # 只保存最原始梯度
+    save_path = os.path.join(CURRENT_RUN_DIR, f"grad_original_weighted_{timestamp}.pt")
     torch.save(grad.cpu(), save_path)
     # 新增：加入核心拒绝词梯度屏蔽（与之前整理的单个拒绝词对应，彻底消除拒绝噪声）
-    refusal_tokens = [
-        # 歉意类
-        tokenizer.encode("sorry", add_special_tokens=False)[0],
-        tokenizer.encode("apologize", add_special_tokens=False)[0],
-        tokenizer.encode("apologies", add_special_tokens=False)[0],
-        # 能力限制类
-        tokenizer.encode("cannot", add_special_tokens=False)[0],
-        tokenizer.encode("can't", add_special_tokens=False)[0],
-        tokenizer.encode("not", add_special_tokens=False)[0],
-        tokenizer.encode("unable", add_special_tokens=False)[0],
-        tokenizer.encode("capable", add_special_tokens=False)[0],
-        # 伦理/法律禁忌类
-        tokenizer.encode("illegal", add_special_tokens=False)[0],
-        tokenizer.encode("unethical", add_special_tokens=False)[0],
-        tokenizer.encode("ethical", add_special_tokens=False)[0],
-        tokenizer.encode("legal", add_special_tokens=False)[0],
-        # 其他拒绝/限制类
-        tokenizer.encode("must", add_special_tokens=False)[0],
-        tokenizer.encode("never", add_special_tokens=False)[0],
-        tokenizer.encode("responsible", add_special_tokens=False)[0]
-    ]
+    #refusal_tokens = [
+    #     # 歉意类
+    #     tokenizer.encode("sorry", add_special_tokens=False)[0],
+    #     tokenizer.encode("apologize", add_special_tokens=False)[0],
+    #     tokenizer.encode("apologies", add_special_tokens=False)[0],
+    #     # 能力限制类
+    #     tokenizer.encode("cannot", add_special_tokens=False)[0],
+    #     tokenizer.encode("can't", add_special_tokens=False)[0],
+    #     tokenizer.encode("not", add_special_tokens=False)[0],
+    #     tokenizer.encode("unable", add_special_tokens=False)[0],
+    #     tokenizer.encode("capable", add_special_tokens=False)[0],
+    #     # 伦理/法律禁忌类
+    #     tokenizer.encode("illegal", add_special_tokens=False)[0],
+    #     tokenizer.encode("unethical", add_special_tokens=False)[0],
+    #     tokenizer.encode("ethical", add_special_tokens=False)[0],
+    #     tokenizer.encode("legal", add_special_tokens=False)[0],
+    #     # 其他拒绝/限制类
+    #     tokenizer.encode("must", add_special_tokens=False)[0],
+    #     tokenizer.encode("never", add_special_tokens=False)[0],
+    #     tokenizer.encode("responsible", add_special_tokens=False)[0]
+    # ]
     #refusal_tokens = torch.tensor(refusal_tokens, device=grad.device)
     # grad[:, refusal_tokens] = float('inf')
 
     # L2归一化，让梯度幅度更平稳，减少噪声干扰
-    grad = grad / grad.norm(dim=-1, keepdim=True)
+    # grad = grad / grad.norm(dim=-1, keepdim=True)
     topk_result = (-grad).topk(adaptive_topk, dim=1)
     top_indices = topk_result.indices
     topk_values = topk_result.values
@@ -359,6 +364,7 @@ def token_gradients_mul(model,input_ids,control_slice,target_slice,loss_slice,
                 print(f"best_idx update to {best_idx}")
         # ✅ 更新到最优目标
         current_target_index = best_idx
+        update_counter = 0
     else:
         # target_slice = current_sim_input_slices["target_slice"]
         targets = input_ids[target_slice]
@@ -710,6 +716,12 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
                     args=args,
                     test_prefixes=test_prefixes
                 )
+
+                # 👈 就在这里！！！加这 3 行！！！
+                control_slice = current_sim_input_slices["control_slice"]
+                target_slice = current_sim_input_slices["target_slice"]
+                loss_slice = current_sim_input_slices["loss_slice"]
+
                 # 梯度一致性判断
                 re_flag = torch.allclose(coordinate_grad_debug, coordinate_grad, atol=1e-6)
                 if re_flag:
@@ -890,8 +902,6 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
             with open(log_json_file, 'w', encoding='utf-8') as f:
                 json.dump(log_dict, f, ensure_ascii=False, indent=2)
 
-    with open(log_json_file, 'w', encoding='utf-8') as f:
-        json.dump(log_dict, f, ensure_ascii=False, indent=2)
 
     best_result = {
         "optimize_target": args.loss_type,
@@ -951,11 +961,11 @@ if __name__ == '__main__':
     parser.add_argument('--use_ppl_filter', type=lambda x: x.lower() == 'true', default=False)
     parser.add_argument('--str_init',  type=str, default="! ! ! ! ! ! ! ! ! ! ! ! ! ! ! ! ! ! ! !")
     parser.add_argument('--stick_steps', type=int, default=3)
-    parser.add_argument('--use_multi_target', type=lambda x: x.lower() == 'true', default=False)
+    parser.add_argument('--use_multi_target', type=lambda x: x.lower() == 'true', default=True)
     parser.add_argument('--use_contrast_loss', type=lambda x: x.lower() == 'true', default=False)
     parser.add_argument('--neg_weight', type=float, default=500.0, help="负样本对比强度")
     parser.add_argument('--use_weighted_sample', type=lambda x: x.lower() == 'true', default=False)
-    parser.add_argument('--target_similar_key', type=str, default="target_similar1",
+    parser.add_argument('--target_similar_key', type=str, default="target_similar2",
                         help="配置文件中目标相似列表的key（默认target_similar1，可修改为其他key区分不同相似列表）")
 
 
