@@ -2,7 +2,7 @@ import threading
 import time
 import random
 import datetime
-from run_single_attack_base import (run_single_process,run_single_process_select_method)
+from run_single_attack_base import run_single_process
 import os
 # make the timestamp utc-8
 import argparse
@@ -10,8 +10,9 @@ import argparse
 # 创建参数解析器对象，用于处理外部传入的参数
 parser = argparse.ArgumentParser()
 parser.add_argument('--defense', type=str, default="no_defense")
-#parser.add_argument('--behaviors_config', type=str, default="behaviors_config.json")
-parser.add_argument('--output_path', type=str,default='ours')
+parser.add_argument('--behaviors_config', type=str, default="behaviors_config.json")
+parser.add_argument('--output_path', type=str,
+                    default='ours')
 
 # ===================== 2. 全局配置初始化 =====================
 
@@ -21,19 +22,12 @@ device_list = [0]
 defense=args.defense
 timestamp = (datetime.datetime.now() + datetime.timedelta(hours=8)).strftime("%Y%m%d-%H%M%S")
 # 拼接最终输出路径：根目录(Our_GCG_target_len_20) + 用户指定路径 + 时间戳
-#model_path = r"D:\Model\Llama-2-7b-chat-hf"
-model_path = r"D:\Model\vicuna-7b-v1.3"
-
-# 🔥 自动提取模型文件夹名称（核心）
-model_name = os.path.basename(model_path)
-# 🔥 拼接你要的输出路径（完全不写死）
-output_path = os.path.join(f"{model_name}_result", args.output_path)
+output_path=os.path.join("Our_GCG_target_len_20",args.output_path)
 output_path=os.path.join(output_path,str(timestamp))
 
-behaviors_config="adv_similar.json"
+behaviors_config=args.behaviors_config
 # 生成攻击行为ID列表：1-50（对应配置文件中50个有害行为）
 behavior_id_list = [i + 1 for i in range(50)]
-# behavior_id_list = list(range(50, 0, -1))
 # add id to black_list to skip the id
 # 以下为预留的黑白名单配置（注释状态，可启用）：
 # 黑名单：添加需要跳过的攻击ID，执行时会过滤掉这些ID
@@ -86,30 +80,7 @@ def worker_task(task_list, resource_manager):
 
         print(f"Processing task {task} using card {card.id}")
         # 实际执行的逻辑，其他的代码都是并行处理逻辑
-        num_steps = 2
-        batch_size = 2
-
-        # model_path = "/home/liyubo/Model/Llama-2-7b-chat-hf"
-
-        run_single_process_select_method(behavior_id=task, device=card.id, output_path=output_path,
-                                         defense=defense, behaviors_config=behaviors_config, num_steps=num_steps,
-                                         batch_size=batch_size, loss_type="cross_entropy",
-                                         model_path=model_path)
-        run_single_process_select_method(behavior_id = task, device = card.id, output_path = output_path,
-                                         defense = defense,behaviors_config = behaviors_config, num_steps = num_steps,
-                                         batch_size=batch_size,loss_type="cross_entropy",
-                                         model_path=model_path,use_multi_target="True",
-                                         target_similar_key = "target_similar1")
-
-        run_single_process_select_method(behavior_id=task, device=card.id, output_path=output_path,
-                                         defense=defense, behaviors_config=behaviors_config, num_steps=num_steps,
-                                         batch_size=batch_size, loss_type="cross_entropy",
-                                         model_path=model_path, use_multi_target="True",
-                                         target_similar_key="target_similar2")
-
-
-
-
+        run_single_process(task, card.id, output_path,defense,behaviors_config)
         resource_manager.release_card(card)
 
 # ===================== 5. 主程序入口 =====================

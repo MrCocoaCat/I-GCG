@@ -157,7 +157,8 @@ class SuffixManagerMulTarget:
            # input_ids_e= slices["input_ids"]
             toks = self.tokenizer(prompt).input_ids
             target_slice_stop= slices["target_slice"].stop
-            input_ids = torch.tensor(toks[:target_slice_stop])
+            # input_ids = torch.tensor(toks[:target_slice_stop])
+            input_ids = torch.tensor(toks)
             sim_input_ids_list.append((input_ids,slices))
 
         return sim_input_ids_list
@@ -174,41 +175,15 @@ def sample_control_weighted(control_toks, grad, batch_size, topk=128, temp=1.0, 
     # 自适应TopK（根据batch自动调整，避免重复）
     # adaptive_topk = max(topk, batch_size * 2, 32)
     adaptive_topk = topk
-    if not_allowed_tokens is not None:
-        grad[:, not_allowed_tokens.to(grad.device)] = float('inf')
+    #if not_allowed_tokens is not None:
+    #    grad[:, not_allowed_tokens.to(grad.device)] = float('inf')
         # 🔥 8位日期 + 毫秒（完美可读性 + 永不重复）
         # 保存最原始梯度（自动进入本次运行的文件夹）
     timestamp = time.strftime("%Y%m%d_%H%M%S") + f"_{int(time.time() * 1000) % 1000}"
     save_path = os.path.join(CURRENT_RUN_DIR, f"grad_original_weighted_{timestamp}.pt")
     torch.save(grad.cpu(), save_path)
-    # 新增：加入核心拒绝词梯度屏蔽（与之前整理的单个拒绝词对应，彻底消除拒绝噪声）
-    #refusal_tokens = [
-    #     # 歉意类
-    #     tokenizer.encode("sorry", add_special_tokens=False)[0],
-    #     tokenizer.encode("apologize", add_special_tokens=False)[0],
-    #     tokenizer.encode("apologies", add_special_tokens=False)[0],
-    #     # 能力限制类
-    #     tokenizer.encode("cannot", add_special_tokens=False)[0],
-    #     tokenizer.encode("can't", add_special_tokens=False)[0],
-    #     tokenizer.encode("not", add_special_tokens=False)[0],
-    #     tokenizer.encode("unable", add_special_tokens=False)[0],
-    #     tokenizer.encode("capable", add_special_tokens=False)[0],
-    #     # 伦理/法律禁忌类
-    #     tokenizer.encode("illegal", add_special_tokens=False)[0],
-    #     tokenizer.encode("unethical", add_special_tokens=False)[0],
-    #     tokenizer.encode("ethical", add_special_tokens=False)[0],
-    #     tokenizer.encode("legal", add_special_tokens=False)[0],
-    #     # 其他拒绝/限制类
-    #     tokenizer.encode("must", add_special_tokens=False)[0],
-    #     tokenizer.encode("never", add_special_tokens=False)[0],
-    #     tokenizer.encode("responsible", add_special_tokens=False)[0]
-    # ]
-    #refusal_tokens = torch.tensor(refusal_tokens, device=grad.device)
-    # grad[:, refusal_tokens] = float('inf')
 
-    # L2归一化，让梯度幅度更平稳，减少噪声干扰
-    # grad = grad / grad.norm(dim=-1, keepdim=True)
-    topk_result = (-grad).topk(adaptive_topk, dim=1)
+    topk_result = (-grad).topk(adaptive_topk * 2 , dim=1)
     top_indices = topk_result.indices
     topk_values = topk_result.values
 
@@ -219,6 +194,27 @@ def sample_control_weighted(control_toks, grad, batch_size, topk=128, temp=1.0, 
         0, len(control_toks), len(control_toks) / batch_size,
         device=grad.device
     ).type(torch.int64)
+
+    # ===================== Mask-GCG 加权位置采样 =====================
+    num_control = len(control_toks)
+
+    grad_norm = grad.abs().sum(dim=-1)  # L1 norm
+
+
+    position_prob = torch.softmax(grad_norm / 0.1, dim=0)
+
+    new_token_pos = []
+    used_pos = set()
+    while len(new_token_pos) < batch_size:
+        pos = torch.multinomial(position_prob, 1).item()
+        if pos not in used_pos:
+            used_pos.add(pos)
+            new_token_pos.append(pos)
+    new_token_pos = torch.tensor(new_token_pos, device=grad.device)
+
+
+
+
     selected_topk_values = torch.index_select(topk_values, dim=0, index=new_token_pos)
     # probs = torch.softmax(selected_topk_values / temp, dim=-1)
 
@@ -361,6 +357,7 @@ def token_gradients_mul(model,input_ids,control_slice,target_slice,loss_slice,
             if current_loss < min_loss:
                 min_loss = current_loss
                 best_idx = idx
+                best_target_str = tokenizer.decode(targets, skip_special_tokens=True)  # 👈 加这行
                 print(f"best_idx update to {best_idx}")
         # ✅ 更新到最优目标
         current_target_index = best_idx
@@ -721,6 +718,7 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
                 control_slice = current_sim_input_slices["control_slice"]
                 target_slice = current_sim_input_slices["target_slice"]
                 loss_slice = current_sim_input_slices["loss_slice"]
+                best_target_str = best_target_str
 
                 # 梯度一致性判断
                 re_flag = torch.allclose(coordinate_grad_debug, coordinate_grad, atol=1e-6)
@@ -741,7 +739,7 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
                     target_slice,
                     suffix_manager._loss_slice,tokenizer
                 )
-                best_target_str = suffix_manager.target
+
             with torch.no_grad():
                 top_k = args.top_k
                 adv_suffix_tokens = input_ids[control_slice].to(device)
@@ -950,7 +948,7 @@ if __name__ == '__main__':
     parser.add_argument('--model_path', type=str, default=r"D:\Model\Llama-2-7b-chat-hf")
     parser.add_argument('--device', type=int, default=0)
     parser.add_argument('--id', type=int, default=30)
-    parser.add_argument('--behaviors_config', type=str, default="adv_similar.json")
+    parser.add_argument('--behaviors_config', type=str, default="./data/aug_20260428_111458_all.json")
     parser.add_argument('--output_path', type=str,
                         default=f'./output/{datetime.datetime.now().strftime("%Y%m%d-%H%M%S")}')
     parser.add_argument('--batch_size', type=int, default=8)
@@ -963,9 +961,9 @@ if __name__ == '__main__':
     parser.add_argument('--stick_steps', type=int, default=3)
     parser.add_argument('--use_multi_target', type=lambda x: x.lower() == 'true', default=True)
     parser.add_argument('--use_contrast_loss', type=lambda x: x.lower() == 'true', default=False)
-    parser.add_argument('--neg_weight', type=float, default=500.0, help="负样本对比强度")
+    # parser.add_argument('--neg_weight', type=float, default=500.0, help="负样本对比强度")
     parser.add_argument('--use_weighted_sample', type=lambda x: x.lower() == 'true', default=False)
-    parser.add_argument('--target_similar_key', type=str, default="target_similar2",
+    parser.add_argument('--target_similar_key', type=str, default="target_similar",
                         help="配置文件中目标相似列表的key（默认target_similar1，可修改为其他key区分不同相似列表）")
 
 
@@ -1035,7 +1033,7 @@ if __name__ == '__main__':
         ("Stick Steps", args.stick_steps),
         ("Use Multi Target", args.use_multi_target),
         ("Use Contrast Loss", args.use_contrast_loss),
-        ("Neg Weight", args.neg_weight),
+      #  ("Neg Weight", args.neg_weight),
         ("Target Similar Key", args.target_similar_key),
     ]
     for k, v in arg_items:

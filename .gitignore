@@ -10,3 +10,4 @@
 /test_select_vicuna_method/ours
 attack_llm_core_base_select_mothed.py
 /grad_logs
+/Llama-2-7b-chat-hf_result
