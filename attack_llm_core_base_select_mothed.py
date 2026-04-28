@@ -687,6 +687,7 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
 
     for i in range(1, num_steps + 1):
         try:
+            best_target_str = ""
             # 自动选择：多目标 / 单目标
             if args.use_multi_target:
                 sim_input_list = suffix_manager.get_sim_input_ids(adv_string=adv_suffix)
@@ -718,7 +719,6 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
                 control_slice = current_sim_input_slices["control_slice"]
                 target_slice = current_sim_input_slices["target_slice"]
                 loss_slice = current_sim_input_slices["loss_slice"]
-                best_target_str = best_target_str
 
                 # 梯度一致性判断
                 re_flag = torch.allclose(coordinate_grad_debug, coordinate_grad, atol=1e-6)
