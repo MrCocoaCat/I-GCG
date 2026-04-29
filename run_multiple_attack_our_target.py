@@ -24,6 +24,7 @@ timestamp = (datetime.datetime.now() + datetime.timedelta(hours=8)).strftime("%Y
 
 model_path = r"D:\Model\vicuna-7b-v1.3"
 model_path = r"D:\Model\Llama-2-7b-chat-hf"
+model_path = "/home/liyubo/Model/Llama-2-7b-chat-hf"
 # 🔥 自动提取模型文件夹名称（核心）
 model_name = os.path.basename(model_path)
 # 🔥 拼接你要的输出路径（完全不写死）
@@ -90,9 +91,14 @@ def worker_task(task_list, resource_manager):
         batch_size = 2
 
         # model_path = "/home/liyubo/Model/Llama-2-7b-chat-hf"
-        behaviors_config = "output_similar_lamma.json"
+
         run_single_process_select_method(behavior_id=task, device=card.id, output_path=output_path,
-                                         defense=defense, behaviors_config=behaviors_config, num_steps=num_steps,
+                                         defense=defense, behaviors_config="./data/behaviors_config.json", num_steps=num_steps,
+                                         batch_size=batch_size, loss_type="cross_entropy",
+                                         model_path=model_path)
+
+        run_single_process_select_method(behavior_id=task, device=card.id, output_path=output_path,
+                                         defense=defense, behaviors_config="./data/behaviors_ours_config.json", num_steps=num_steps,
                                          batch_size=batch_size, loss_type="cross_entropy",
                                          model_path=model_path)
 

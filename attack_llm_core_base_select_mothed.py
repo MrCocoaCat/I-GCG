@@ -52,7 +52,6 @@ class SuffixManagerMulTarget:
         self.input_ids = self.get_input_ids(adv_string=adv_string)
         self.sim_input_ids_list = self.get_sim_input_ids(adv_string=adv_string)
 
-
     def get_prompt(self, adv_string=None):
         if adv_string is not None:
             self.adv_string = adv_string
@@ -145,7 +144,6 @@ class SuffixManagerMulTarget:
         input_ids = torch.tensor(toks[:self._target_slice.stop])
         return input_ids
 
-
     def get_sim_input_ids(self, adv_string=None):
         sim_input_ids_list = []
         self.input_ids = self.get_input_ids(adv_string=adv_string)
@@ -157,11 +155,15 @@ class SuffixManagerMulTarget:
            # input_ids_e= slices["input_ids"]
             toks = self.tokenizer(prompt).input_ids
             target_slice_stop= slices["target_slice"].stop
-            # input_ids = torch.tensor(toks[:target_slice_stop])
-            input_ids = torch.tensor(toks)
+            input_ids = torch.tensor(toks[:target_slice_stop])
+            #pred_str = tokenizer.decode(input_ids, skip_special_tokens=True)
+            #print(pred_str)
+            #input_ids = torch.tensor(toks)
             sim_input_ids_list.append((input_ids,slices))
-
+        # random.shuffle(sim_input_ids_list)
         return sim_input_ids_list
+
+
 
     def control_slice(self, toks=None):
         return self._control_slice if toks is None else toks[self._control_slice]
@@ -211,10 +213,6 @@ def sample_control_weighted(control_toks, grad, batch_size, topk=128, temp=1.0, 
             used_pos.add(pos)
             new_token_pos.append(pos)
     new_token_pos = torch.tensor(new_token_pos, device=grad.device)
-
-
-
-
     selected_topk_values = torch.index_select(topk_values, dim=0, index=new_token_pos)
     # probs = torch.softmax(selected_topk_values / temp, dim=-1)
 
@@ -291,7 +289,6 @@ def token_gradients_mul(model,input_ids,control_slice,target_slice,loss_slice,
     """
 
     best_target_str = ""
-
     embed_weights = get_embedding_matrix(model)
     one_hot = torch.zeros(
         input_ids[control_slice].shape[0],
@@ -307,11 +304,37 @@ def token_gradients_mul(model,input_ids,control_slice,target_slice,loss_slice,
     one_hot.requires_grad_()
     # 2. 生成嵌入并前向传播
     input_embeds = (one_hot @ embed_weights).unsqueeze(0)
-    embeds = get_embeddings(model, input_ids.unsqueeze(0)).detach()
-    full_embeds = torch.cat(
-        [embeds[:, :control_slice.start, :], input_embeds, embeds[:, control_slice.stop:, :]],
-        dim=1
-    )
+    #embeds = get_embeddings(model, input_ids.unsqueeze(0)).detach()
+    # full_embeds = torch.cat(
+    #     [embeds[:, :control_slice.start, :], input_embeds,
+    #      embeds[:, control_slice.stop:, :]
+    #      ],
+    #     dim=1
+    # )
+
+    # 构造 BATCH：所有目标并行输入
+    all_input_ids = [sim_item[0] for sim_item in sim_input_list]
+    # 1. 找到最长的长度，统一补齐
+    max_len = max(ids.shape[0] for ids in all_input_ids)
+
+    # 2. 右侧补 0（pad）对齐长度
+    padded_ids = []
+    for ids in all_input_ids:
+        pad_len = max_len - ids.shape[0]
+        padded = torch.cat([ids, torch.zeros(pad_len, dtype=ids.dtype, device=ids.device)])
+        padded_ids.append(padded)
+
+    batch_input_ids = torch.stack(padded_ids).to(device)
+
+    # 只替换 suffix 对应的部分（GCG 官方逻辑）
+    embeds_batch = get_embeddings(model, batch_input_ids).detach()
+
+    # 替换 suffix 位置
+    prefix = embeds_batch[:, :control_slice.start, :]
+    suffix_part = input_embeds.repeat(embeds_batch.shape[0], 1, 1)
+    post = embeds_batch[:, control_slice.stop:, :]
+    full_embeds = torch.cat([prefix, suffix_part, post], dim=1)
+
     outputs = model(inputs_embeds=full_embeds)
     logits = outputs.logits
 
@@ -332,7 +355,9 @@ def token_gradients_mul(model,input_ids,control_slice,target_slice,loss_slice,
             logit_len = loss_slice.stop - loss_slice.start
             targets = sim_ids[target_slice].to(device)
 
-            logit = logits[0, loss_slice, :]
+            # logit = logits[0, loss_slice, :]
+            logit = logits[idx, loss_slice, :]
+
             pred_tokens = logit.argmax(dim=-1)
             pred_str = tokenizer.decode(pred_tokens, skip_special_tokens=True)
             # ===================== 【合并输出】=====================
@@ -358,7 +383,7 @@ def token_gradients_mul(model,input_ids,control_slice,target_slice,loss_slice,
                 min_loss = current_loss
                 best_idx = idx
                 best_target_str = tokenizer.decode(targets, skip_special_tokens=True)  # 👈 加这行
-                print(f"best_idx update to {best_idx}")
+                print(f" 👈  best_idx update to {best_idx}")
         # ✅ 更新到最优目标
         current_target_index = best_idx
         update_counter = 0
@@ -368,7 +393,8 @@ def token_gradients_mul(model,input_ids,control_slice,target_slice,loss_slice,
         target_str = tokenizer.decode(targets, skip_special_tokens=True)
         best_target_str = target_str
         # 计算 loss
-        logit = logits[0, loss_slice, :]
+        #logit = logits[0, loss_slice, :]
+        logit = logits[current_target_index, loss_slice, :]
         pred_tokens = logit.argmax(dim=-1)
         pred_str = tokenizer.decode(pred_tokens, skip_special_tokens=True)
         print(f"🎯 这是数据集中得数据，TARGET: {repr(target_str)}")
@@ -383,7 +409,9 @@ def token_gradients_mul(model,input_ids,control_slice,target_slice,loss_slice,
         neg_start = target_slice.start
         neg_end = neg_start + max_neg_len
         neg_slice = slice(neg_start, neg_end)
-        neg_logits = logits[0, neg_slice, :]  # shape: [max_neg_len, vocab]
+        #neg_logits = logits[0, neg_slice, :]  # shape: [max_neg_len, vocab]
+
+        neg_logits = logits[current_target_index, neg_slice, :]
         for neg_sent in test_prefixes:
             nt = tokenizer.encode(neg_sent, add_special_tokens=False)
             # 3. 统一长度：超过截断，不够 补齐最后一个token（无pad，最真实）
@@ -400,7 +428,7 @@ def token_gradients_mul(model,input_ids,control_slice,target_slice,loss_slice,
     loss.backward()
     one_hot_grad = one_hot.grad.clone()
     grad_l2 = one_hot_grad / one_hot_grad.norm(dim=-1, keepdim=True)
-    del one_hot, input_embeds, embeds, full_embeds, outputs, logits, loss
+    del one_hot, input_embeds, embeds_batch, full_embeds, outputs, logits, loss
     torch.cuda.empty_cache()
     gc.collect()
     # ✅ 返回梯度 + 最优目标信息
@@ -671,12 +699,14 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
     #log_json_file = pathlib.Path(f'{args.output_path}/log/{mu}_{con_loss}_{args.loss_type}_{ppl_suffix}_{args.str_init}_{sample_method}_{args.id}.json')
     #candidates_file_path = pathlib.Path( f'{args.output_path}/candidates/{mu}_{con_loss}_{args.loss_type}_{ppl_suffix}_{args.str_init}_{sample_method}_{args.id}.json')
 
+
+    dataset = os.path.splitext(os.path.basename(args.behaviors_config))[0]
     submission_json_file = pathlib.Path(
-        f'{args.output_path}/submission/{mu}{args.loss_type}{ppl_suffix}_{sample_method}_{args.target_similar_key}_{args.id}.json')
+        f'{args.output_path}/submission/{dataset}/{mu}{args.loss_type}{ppl_suffix}_{sample_method}_{args.target_similar_key}_{args.id}.json')
     log_json_file = pathlib.Path(
-        f'{args.output_path}/log/{mu}_{con_loss}_{args.loss_type}_{ppl_suffix}_{sample_method}_{args.target_similar_key}_{args.id}.json')
+        f'{args.output_path}/log/{dataset}/{mu}_{con_loss}_{args.loss_type}_{ppl_suffix}_{sample_method}_{args.target_similar_key}_{args.id}.json')
     candidates_file_path = pathlib.Path(
-        f'{args.output_path}/candidates/{mu}_{con_loss}_{args.loss_type}_{ppl_suffix}_{sample_method}_{args.target_similar_key}_{args.id}.json')
+        f'{args.output_path}/candidates/{dataset}/{mu}_{con_loss}_{args.loss_type}_{ppl_suffix}_{sample_method}_{args.target_similar_key}_{args.id}.json')
 
     if not candidates_file_path.parent.exists():
         os.makedirs(candidates_file_path.parent, exist_ok=True)
@@ -697,13 +727,15 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
                 control_slice = current_sim_input_slices["control_slice"]
                 target_slice = current_sim_input_slices["target_slice"]
                 loss_slice = current_sim_input_slices["loss_slice"]
-                coordinate_grad_debug = token_gradients(
-                    model, input_ids,
-                    control_slice,
-                    target_slice,
-                    suffix_manager._loss_slice,
-                    tokenizer
-                )
+                # coordinate_grad_debug = token_gradients(
+                #     model, input_ids,
+                #     control_slice,
+                #     target_slice,
+                #     suffix_manager._loss_slice,
+                #     tokenizer
+                # )
+                pred_str = tokenizer.decode(input_ids, skip_special_tokens=True)
+                print(pred_str)
                 coordinate_grad, best_target_str, current_target_index = token_gradients_mul(
                     model,input_ids,control_slice,target_slice,loss_slice,
                     suffix_manager, tokenizer, device,
@@ -721,14 +753,14 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
                 loss_slice = current_sim_input_slices["loss_slice"]
 
                 # 梯度一致性判断
-                re_flag = torch.allclose(coordinate_grad_debug, coordinate_grad, atol=1e-6)
-                if re_flag:
-                    print("##############################    mul same as singal  ####################")
-                else:
-                    print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!! mul is diffents ! !!!!!!!!!!!!!!!!!!!!!!")
-                    print(f"coordinate_grad_debug:\n{coordinate_grad_debug}")
-                    print(f"coordinate_grad:\n{coordinate_grad}")
-                update_counter = update_counter + 1
+                # re_flag = torch.allclose(coordinate_grad_debug, coordinate_grad, atol=1e-6)
+                # if re_flag:
+                #     print("##############################    mul same as singal  ####################")
+                # else:
+                #     print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!! mul is diffents ! !!!!!!!!!!!!!!!!!!!!!!")
+                #     print(f"coordinate_grad_debug:\n{coordinate_grad_debug}")
+                #     print(f"coordinate_grad:\n{coordinate_grad}")
+                # update_counter = update_counter + 1
             else:
                 input_ids = suffix_manager.get_input_ids(adv_string=adv_suffix).to(device)
                 control_slice = suffix_manager._control_slice
@@ -948,7 +980,7 @@ if __name__ == '__main__':
     parser.add_argument('--model_path', type=str, default=r"D:\Model\Llama-2-7b-chat-hf")
     parser.add_argument('--device', type=int, default=0)
     parser.add_argument('--id', type=int, default=30)
-    parser.add_argument('--behaviors_config', type=str, default="./data/aug_20260428_111458_all.json")
+    parser.add_argument('--behaviors_config', type=str, default="./data/eda_final_20260428_112656_synonym.json")
     parser.add_argument('--output_path', type=str,
                         default=f'./output/{datetime.datetime.now().strftime("%Y%m%d-%H%M%S")}')
     parser.add_argument('--batch_size', type=int, default=8)

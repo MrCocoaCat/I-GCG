@@ -107,9 +107,7 @@ def token_gradients(model, input_ids, input_slice, target_slice, loss_slice,toke
     return grad_l2
 
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
+
 
 
 def token_gradients_embeding(model, input_ids, input_slice, target_slice, loss_slice):

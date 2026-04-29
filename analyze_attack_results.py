@@ -265,7 +265,7 @@ def main():
     print("=" * 70)
 
     ppl_suffix = "ppl" if args.use_ppl_filter else ""
-    log_dir = pathlib.Path(r"D:\GitHub\I-GCG\Llama-2-7b-chat-hf_result\ours\20260426-034313\log")
+    log_dir = pathlib.Path(r"D:\GitHub\I-GCG\Llama-2-7b-chat-hf_result\ours\20260429-021051\log")
 
     method_configs = [
         {"name": "single",       "con_loss": "", "mu": "",      "loss_type": "cross_entropy",   "sample_method": "", "target_similar_key":""},
@@ -276,11 +276,14 @@ def main():
     id_sets = []
     file_prefix_map = {}
     for cfg in method_configs:
+        #f'{args.output_path}/log/{mu}_{con_loss}_{args.loss_type}_{ppl_suffix}_{sample_method}_{args.target_similar_key}_{args.id}.json')
         file_prefix = log_dir / f'{cfg["mu"]}_{cfg["con_loss"]}_{cfg["loss_type"]}_{ppl_suffix}_{cfg["sample_method"]}_{cfg["target_similar_key"]}'
+        print(file_prefix)
         file_prefix_map[cfg["name"]] = file_prefix
         ids = set()
-        for run_id in range(1, 50):
+        for run_id in range(50, 0, -1):
             f_path = pathlib.Path(f"{file_prefix}_{run_id}.json")
+            print(f_path)
             if f_path.exists():
                 ids.add(run_id)
         id_sets.append(ids)
