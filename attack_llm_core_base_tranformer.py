@@ -25,8 +25,7 @@ if not repo_root:
     repo_root = os.path.dirname(experiments_dir)
 sys.path.append(os.path.abspath(repo_root))
 
-from llm_attacks.minimal_gcg.opt_utils import (
-    token_gradients, get_logits, generate,
+from llm_attacks.minimal_gcg.opt_utils import ( get_logits, generate,
     load_model_and_tokenizer, get_filtered_cands,get_embedding_matrix,get_embeddings
 )
 from llm_attacks.minimal_gcg.string_utils import load_conversation_template
@@ -39,6 +38,80 @@ GRAD_SAVE_ROOT = "./grad_logs"
 CURRENT_RUN_DIR = os.path.join(GRAD_SAVE_ROOT, time.strftime("%Y%m%d_%H%M%S"))
 os.makedirs(CURRENT_RUN_DIR, exist_ok=True)
 # ==================================================================
+def token_gradients(model, input_ids, input_slice, target_slice, loss_slice, tokenizer):
+    #  1. 获取模型的词嵌入矩阵（shape: [词表大小, 嵌入维度]）
+    #  作用：将Token ID转换为嵌入向量，是梯度计算的基础
+    embed_weights = get_embedding_matrix(model)
+    # 2. 构造对抗切片Token的One-Hot编码（仅对抗Token可导）
+    # shape: [对抗切片长度, 词表大小]，初始全0
+    one_hot = torch.zeros(
+        input_ids[input_slice].shape[0],
+        embed_weights.shape[0],
+        device=model.device,
+        dtype=embed_weights.dtype
+    )
+    # 将当前对抗Token的位置设为1（One-Hot编码核心）
+    one_hot.scatter_(
+        dim=1,
+        index=input_ids[input_slice].unsqueeze(1),
+        src=torch.ones(one_hot.shape[0], 1, device=model.device, dtype=embed_weights.dtype)
+    )
+    # 开启One-Hot张量的梯度追踪（核心：仅对抗Token的嵌入可导）
+    one_hot.requires_grad_()
+    # 3. 将One-Hot编码转换为Token嵌入向量
+    #     @ 是矩阵乘法：[对抗长度,词表大小] × [词表大小,嵌入维度] = [对抗长度,嵌入维度]
+    #     unsqueeze(0) 扩展为[1, 对抗长度, 嵌入维度]，适配模型输入格式
+    input_embeds = (one_hot @ embed_weights).unsqueeze(0)
+
+    # now stitch it together with the rest of the embeddings
+    # 4. 拼接完整的输入嵌入（固定非对抗区域 + 可导对抗区域）
+    # 先获取完整输入的嵌入（detach()：非对抗区域嵌入固定，不计算梯度）
+    # .detach() 会返回一个新的张量，这个新张量和原张量共享数据（内存相同），但从计算图中脱离—— 简单说，新张量不再参与梯度计算，也不会被 backward() 反向传播影响。
+    embeds = get_embeddings(model, input_ids.unsqueeze(0)).detach()
+    # 拼接逻辑：[对抗前嵌入] + [可导对抗嵌入] + [对抗后嵌入]
+    full_embeds = torch.cat(
+        [
+            embeds[:, :input_slice.start, :],
+            input_embeds,
+            embeds[:, input_slice.stop:, :]
+        ],
+        dim=1)
+    # 5. 模型前向传播，获取Logits（未归一化的概率）
+    # inputs_embeds：直接传入嵌入向量，替代input_ids（因为部分嵌入可导）
+
+    # outputs = model(inputs_embeds=full_embeds)
+
+    # 1. 前向传播，输出注意力
+    outputs = model(inputs_embeds=full_embeds, output_attentions=True)
+
+    # 2. 取出最后一层注意力
+    last_attn = outputs.attentions[-1]  # [1, heads, seq, seq]
+
+    # 3. 多头平均
+    attn_map = last_attn.mean(dim=1).squeeze(0)  # [seq, seq]
+
+    logits = outputs.logits
+    targets = input_ids[target_slice]
+    outputs_targets_logits = logits[0, loss_slice, :]
+
+    target_str = tokenizer.decode(targets, skip_special_tokens=True)
+    pred_tokens = outputs_targets_logits.argmax(dim=-1)
+    pred_str = tokenizer.decode(pred_tokens, skip_special_tokens=True)
+    print(f"🎯 上次优化的结果，   TARGET: {repr(target_str)}")
+    print(f"🤖 这是模型输出得结果，PREDIC: {repr(pred_str)}")
+
+    loss = nn.CrossEntropyLoss()(outputs_targets_logits, targets)
+    # 7. 反向传播计算梯度（仅更新one_hot.grad）
+    loss.backward()
+    # 8. 提取并归一化梯度
+    # L2归一化：梯度除以自身范数，保证不同Token梯度尺度一致，便于后续采样
+    # L2 归一化仅缩放向量长度，不改变元素比例（方向），而求和归一化会彻底改变元素比例
+    # L2 归一化能让不同 Token 的梯度 “长度 = 1”，保证更新步长的公平性，
+    one_hot_grad = one_hot.grad.clone()
+    grad_l2 = one_hot_grad / one_hot_grad.norm(dim=-1, keepdim=True)
+    # 返回归一化后的梯度：指导对抗Token的优化方向
+    attn_map = attn_map.detach().clone()
+    return grad_l2, attn_map,target_str, pred_str
 
 class GradPolicyCNN(nn.Module):
     def __init__(self, suffix_len, vocab_size, topk, hidden_dim=64):
@@ -63,16 +136,43 @@ class GradPolicyCNN(nn.Module):
             # 全局池化：压缩成整体特征
             nn.AdaptiveAvgPool2d((1, 1))
         )
+        # ==============================================
+        # 2. 注意力分支（和梯度分支完全对称）
+        # 输入：注意力矩阵 [seq_len, seq_len] 动态尺寸
+        # ==============================================
+        self.attn_cnn = nn.Sequential(
+            nn.Conv2d(1, hidden_dim, 3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(hidden_dim, hidden_dim * 2, 3, padding=1),
+            nn.ReLU(),
+            nn.AdaptiveAvgPool2d((1, 1))  # 任意尺寸 → 固定向量
+        )
 
-        # 输出头：决定位置 + token
+        # ==================== 融合层（保持你原来的维度） ====================
+        # 你原来：hidden_dim * 2
+        # 现在：grad + attn + grad*attn → 依旧映射回 hidden_dim*2
+        self.fusion = nn.Linear(hidden_dim * 2 * 3, hidden_dim * 2)
+        self.relu = nn.ReLU()
+        # ==================== 输出头（完全没变） ====================
         self.head = nn.Linear(hidden_dim * 2, suffix_len + topk)
 
-    def forward(self, grad, batch_size, temp=1.0):
+    def forward(self, grad, attn_map,batch_size, temp=1.0):
         suffix_len = grad.shape[0]
 
         # 输入格式对齐
         x = grad.unsqueeze(0).unsqueeze(0).to(self.cnn[0].weight.dtype)
-        feat = self.cnn(x).flatten()
+        grad_feat = self.cnn(x).flatten()
+
+        # ========== 注意力特征 ==========
+        a = attn_map.unsqueeze(0).unsqueeze(0).to(self.attn_cnn[0].weight.dtype)
+        attn_feat = self.attn_cnn(a).flatten()  # [128]
+
+        # ========== 融合（绝对安全） ==========
+        mul = grad_feat * attn_feat  # ✅ 同维度，绝不报错
+        feat = torch.cat([grad_feat, attn_feat, mul], dim=-1)
+        feat = self.relu(self.fusion(feat))
+
+
         out = self.head(feat)
 
         # 拆分：位置分布 + 序号分布
@@ -182,32 +282,22 @@ def check_input_ids_ppl(model, tokenizer, input_ids):
     return prompt_ppl
 
 
-def check_for_attack_success(model, tokenizer, input_ids, assistant_role_slice, test_prefixes, gen_config=None):
-    gen_str = tokenizer.decode(
-        generate(model, tokenizer, input_ids, assistant_role_slice, gen_config=gen_config)
-    ).strip()
-    jailbroken = not any([prefix in gen_str for prefix in test_prefixes])
-    return jailbroken, gen_str
-
 
 def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_steps, device, test_prefixes, args):
     # ===================== 多目标私有状态（线程安全）=====================
 
     control_slice = suffix_manager.control_slice()
     suffix_len = control_slice.stop - control_slice.start
-
     current_target_index =  0
     vocab_size = model.config.vocab_size
     batch_size = args.batch_size
     guide_head = GradPolicyCNN(suffix_len, vocab_size, args.top_k).to(device)
     # 核心：自动跟随梯度输入的 dtype，彻底杜绝精度冲突
-
-
     opt_guide = torch.optim.Adam(guide_head.parameters(), lr=1e-4)
     not_allowed_tokens = None if allow_non_ascii else get_nonascii_toks(tokenizer)
     adv_suffix = adv_string_init
     log_dict = []
-    best_cos_sim = -float('inf')
+    # best_cos_sim = -float('inf')
     success_count = 0
     early_stop_threshold = 5
 
@@ -230,13 +320,13 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
             input_ids = suffix_manager.get_input_ids(adv_string=adv_suffix).to(device)
             control_slice = suffix_manager._control_slice
             target_slice = suffix_manager._target_slice
-            coordinate_grad = token_gradients(
+            coordinate_grad, attn_map ,target_str, pred_str = token_gradients(
                 model, input_ids,
                 control_slice,
                 target_slice,
                 suffix_manager._loss_slice,tokenizer
             )
-            selected_pos, selected_rank, pos_prob, rk_prob = guide_head(coordinate_grad, batch_size)
+            selected_pos, selected_rank, pos_prob, rk_prob = guide_head(coordinate_grad,attn_map, batch_size)
             with torch.no_grad():
                 top_k = args.top_k
                 adv_suffix_tokens = input_ids[control_slice].to(device)
@@ -270,6 +360,7 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
 
 
             target_ids = ids[:, target_slice]
+
             # --------------------- 1. 交叉熵（梯度来源，完全不变） ---------------------
             crit = nn.CrossEntropyLoss(reduction='none')
             loss_slice = slice(target_slice.start - 1, target_slice.stop - 1)
@@ -279,29 +370,20 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
             ce_loss = losses[best_ce_id].item()
             best_new_adv_suffix = new_adv_suffix[best_ce_id]
             adv_suffix = best_new_adv_suffix
-            # 测试
-            input_ids_new = suffix_manager.get_input_ids(adv_string=adv_suffix).to(device)
-            is_success, gen_str = check_for_attack_success(
-                model, tokenizer, input_ids_new,
-                suffix_manager._assistant_role_slice, test_prefixes
-            )
+
+            is_success = not any([prefix in pred_str for prefix in test_prefixes])
             # ====================== 训练时直接用，不再重复 forward ======================
             # ====================== ✅ 最终 100% 正确策略梯度 ======================
             opt_guide.zero_grad()
-
             # 1. 奖励（越小的loss → 越大的奖励）
             reward = -losses.detach()  # shape [B]
-
-            # 2. 动作的 log 概率 —— 【已修复，完全匹配你的模型】
+          
             pos_log_prob = torch.log(pos_prob[0, selected_pos] + 1e-8)  # [B]
             rk_log_prob = torch.log(rk_prob[0, selected_rank] + 1e-8)  # [B]
-
             # 3. 联合动作概率（核心！必须相加）
             total_log_prob = pos_log_prob + rk_log_prob  # [B]
-
             # 4. 策略梯度（唯一正确公式）
             total_loss = -(total_log_prob * reward).mean()
-
             # 反向传播
             total_loss.backward()
             opt_guide.step()
@@ -320,24 +402,25 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
                 "step": i,
                 "optimize_target": args.loss_type,
                 "ce_loss": ce_loss,
-                "best_cosine_sim": best_cos_sim,
                 "top_k":top_k,
+                "gen_str": pred_str,
                 "attack_success": is_success,
                 "best_adv_suffix": adv_suffix,
                 "current_suffix": best_new_adv_suffix,
-                "gen_str": gen_str,
                 "target": suffix_manager.target,
                 "current_target_index": str(current_target_index),
                 "simple_unique_count":unique_count
             }
             log_dict.append(log_entry)
             print(f"id {args.id} | Step {i:2d} | CNN Loss: {total_loss.item():.6f}| ce_loss: {ce_loss}|" f"Success:{is_success}")
+            print("pos选的位置：", sorted(selected_pos.cpu().tolist()))
+            print("rank选择：", sorted(selected_rank.cpu().tolist()))
         except Exception as e:
             trace_info = traceback.format_exc()
             print(f"\n❌ Step {i} 错误详情：\n{trace_info}")
             log_dict.append({"step": i, "err": str(e), "use_ppl_filter": args.use_ppl_filter})
             continue
-        del coordinate_grad, input_ids, input_ids_new, logits, ids
+        del coordinate_grad, input_ids, logits, ids
         gc.collect()
         torch.cuda.empty_cache()
         if i % 10 == 0:
@@ -578,7 +661,7 @@ if __name__ == '__main__':
     parser.add_argument('--output_path', type=str,
                         default=f'./output/{datetime.datetime.now().strftime("%Y%m%d-%H%M%S")}')
     parser.add_argument('--batch_size', type=int, default=16)
-    parser.add_argument('--top_k', type=int, default=4)
+    parser.add_argument('--top_k', type=int, default=128)
     parser.add_argument('--num_steps', type=int, default=500)
     parser.add_argument('--early_stop', type=bool, default=True)
     parser.add_argument('--loss_type', type=str, default="cross_entropy", choices=["cross_entropy", "cosine", "contrast"])
@@ -600,9 +683,10 @@ if __name__ == '__main__':
     target = behavior_config["target"]
     adv_string_init = args.str_init
 
-    model, tokenizer = load_model_and_tokenizer( args.model_path,
+    model, tokenizer = load_model_and_tokenizer(args.model_path,
                                                 low_cpu_mem_usage=True,
                                                 use_cache=False,
+                                                attn_implementation="eager",
                                                 device=device)
     conv_template = load_conversation_template(template_name)
     suffix_manager = SuffixManager(
