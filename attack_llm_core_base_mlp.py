@@ -97,8 +97,8 @@ def token_gradients(model, input_ids, input_slice, target_slice, loss_slice, tok
     target_str = tokenizer.decode(targets, skip_special_tokens=True)
     pred_tokens = outputs_targets_logits.argmax(dim=-1)
     pred_str = tokenizer.decode(pred_tokens, skip_special_tokens=True)
-    print(f"        🎯 上次优化的结果，   TARGET: {repr(target_str)}")
-    print(f"        🤖 这是模型输出得结果，PREDIC: {repr(pred_str)}")
+    print(f"🎯 上次优化的结果，   TARGET: {repr(target_str)}")
+    print(f"🤖 这是模型输出得结果，PREDIC: {repr(pred_str)}")
 
     loss = nn.CrossEntropyLoss()(outputs_targets_logits, targets)
     # 7. 反向传播计算梯度（仅更新one_hot.grad）
@@ -110,43 +110,83 @@ def token_gradients(model, input_ids, input_slice, target_slice, loss_slice, tok
     one_hot_grad = one_hot.grad.clone()
     grad_l2 = one_hot_grad / one_hot_grad.norm(dim=-1, keepdim=True)
     # 返回归一化后的梯度：指导对抗Token的优化方向
-    attn_map = attn_map.detach().clone()
-    return grad_l2, attn_map,target_str, pred_str
+    attn_map_cl = attn_map.detach().clone()
+
+    # 截取：后缀 ↔ 后缀 的 attention
+    suffix_start = input_slice.start
+    suffix_end = input_slice.stop
+
+    attn_suffix_map = attn_map_cl[
+        suffix_start:suffix_end,
+        suffix_start:suffix_end
+    ]
+
+    return grad_l2, attn_suffix_map,target_str, pred_str
 
 
-def check_for_attack_success(model, tokenizer, prompt: str, suffix: str, test_prefixes: list, gen_config=None):
-    """
-    纯文本输入 → 拼接问题+后缀 → 生成 → 判断是否越狱
-    无多余计算、无熵、无切片、无ids操作
-    """
-    # 拼接完整输入：问题 + 对抗后缀
-    full_input = prompt + " " + suffix
+import torch
+import torch.nn as nn
 
-    # 默认生成参数（可外部传入）
-    if gen_config is None:
-        gen_config = {
-            "max_new_tokens": 64,
-            "do_sample": False,
-            "temperature": 0.0,
-        }
-    # 生成（最干净的推理）
-    inputs = tokenizer(full_input, return_tensors="pt").to(model.device)
-    with torch.no_grad():
-        output_ids = model.generate(
-            **inputs,
-            **gen_config,
-            pad_token_id=tokenizer.eos_token_id
+class GradPolicyMLP(nn.Module):
+    def __init__(self, suffix_len, vocab_size, topk, hidden_dim=128):
+        super().__init__()
+        self.suffix_len = suffix_len
+        self.vocab_size = vocab_size
+        self.hidden_dim = hidden_dim
+
+        # ====================== 梯度分支 ======================
+
+        # 2. 位置维度1D卷积：提取相邻位置梯度变化、局部敏感区
+        self.grad_conv = nn.Sequential(
+            nn.Linear (vocab_size, hidden_dim),
+            nn.GELU(),
+            nn.Linear (hidden_dim, suffix_len),
+            nn.GELU(),
         )
-    # 只解码生成的新内容
-    gen_str = tokenizer.decode(
-        output_ids[0][len(inputs.input_ids[0]):],
-        skip_special_tokens=True
-    ).strip()
-    # 判断是否越狱
-    jailbroken = not any(prefix in gen_str for prefix in test_prefixes)
-    return jailbroken, gen_str
 
-def sample_control(control_toks, grad, batch_size, selected_pos, selected_rank,
+        # ====================== 注意力分支 ======================
+        # 仅线性降维，不做卷积！保留后缀内部原生注意力信息
+        #self.attn_proj = nn.Linear(suffix_len, hidden_dim)
+
+        # ====================== 逐位置融合 ======================
+        # 正确
+        self.fusion = nn.Sequential(
+            nn.Linear(suffix_len * 3, suffix_len * 2),
+            nn.GELU()
+        )
+
+        self.pos_head = nn.Linear(suffix_len * 2, 1)
+
+
+    def forward(self, grad, attn_suffix, batch_size, temp=1.0):
+        dtype = self.grad_conv[0].weight.dtype
+        grad = grad.to(dtype)
+        attn_suffix = attn_suffix.to(dtype)
+
+        # -------------------------- 1. 梯度 CNN --------------------------
+
+        grad_feat = self.grad_conv(grad)  # ✅ [L, suffix_len]
+
+        # -------------------------- 2. 注意力：完全不处理 --------------------------
+        attn_feat = attn_suffix  # [L, suffix_len]
+
+        # -------------------------- 3. 逐位置融合（核心） --------------------------
+        mul_feat = grad_feat * attn_feat
+        fuse_feat = torch.cat([grad_feat, attn_feat, mul_feat], dim=-1)
+        h = self.fusion(fuse_feat)
+
+        # -------------------------- 4. 预测位置 --------------------------
+        pos_logit = self.pos_head(h).squeeze(-1)
+
+
+        pos_prob = torch.softmax(pos_logit / temp, dim=-1)
+        selected_pos = torch.multinomial(pos_prob, batch_size, replacement=True)
+
+
+
+        return selected_pos,  pos_prob
+
+def sample_control(control_toks, grad, batch_size, selected_pos,
     topk=256, temp=1.0, not_allowed_tokens=None):
 
     if not_allowed_tokens is not None:
@@ -156,16 +196,22 @@ def sample_control(control_toks, grad, batch_size, selected_pos, selected_rank,
     control_toks = control_toks.to(grad.device)
 
     original_control_toks = control_toks.repeat(batch_size, 1)
-    new_token_pos = torch.arange(
-        0,
-        len(control_toks),
-        len(control_toks) / batch_size,
-        device=grad.device
-    ).type(torch.int64)
+    # new_token_pos = torch.arange(
+    #     0,
+    #     len(control_toks),
+    #     len(control_toks) / batch_size,
+    #     device=grad.device
+    # ).type(torch.int64)
     #print(new_token_pos, selected_pos)
-
+    new_token_pos = selected_pos
 
     rand_idx = torch.randint(0, topk, (batch_size, 1), device=grad.device)
+    #selected_rank = selected_rank.unsqueeze(-1)
+
+    #print(rand_idx, selected_rank)
+   # rand_idx = selected_rank
+
+
     new_token_val = torch.gather(
         top_indices[new_token_pos], 1,
         rand_idx
@@ -191,6 +237,7 @@ def get_model_embedding_layer(model):
         print("=== 模型结构预览（前10行）===")
         print(str(model)[:1000])
         raise ValueError("未识别的模型结构，请手动指定嵌入层路径！")
+
 
 
 # 全局配置
@@ -227,6 +274,7 @@ def check_input_ids_ppl(model, tokenizer, input_ids):
     return prompt_ppl
 
 
+
 def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_steps, device, test_prefixes, args):
     # ===================== 多目标私有状态（线程安全）=====================
 
@@ -235,9 +283,9 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
     current_target_index =  0
     vocab_size = model.config.vocab_size
     batch_size = args.batch_size
-    #guide_head = GradPolicyCNN(suffix_len, vocab_size, args.top_k).to(device)
+    guide_head = GradPolicyMLP(suffix_len, vocab_size, args.top_k).to(device)
     # 核心：自动跟随梯度输入的 dtype，彻底杜绝精度冲突
-    #opt_guide = torch.optim.Adam(guide_head.parameters(), lr=1e-4)
+    opt_guide = torch.optim.AdamW(guide_head.parameters(), lr=1e-4)
     not_allowed_tokens = None if allow_non_ascii else get_nonascii_toks(tokenizer)
     adv_suffix = adv_string_init
     log_dict = []
@@ -245,32 +293,32 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
     success_count = 0
     early_stop_threshold = 5
 
-
-    sample_method = ""
+    ppl_suffix =  ""
+    mu = ""
+    con_loss = "contrast" if args.use_contrast_loss else ""
+    sample_method = "MLP"
 
 
     submission_json_file = pathlib.Path(
-        f'{args.output_path}/submission/{args.loss_type}_{sample_method}_{args.id}.json')
+        f'{args.output_path}/submission/{mu}{args.loss_type}{ppl_suffix}_{sample_method}_{args.id}.json')
     log_json_file = pathlib.Path(
-        f'{args.output_path}/log/{args.loss_type}_{sample_method}_{args.id}.json')
+        f'{args.output_path}/log/{mu}_{con_loss}_{args.loss_type}_{ppl_suffix}_{sample_method}_{args.id}.json')
     for f in [submission_json_file, log_json_file]:
         if not f.parent.exists():
             os.makedirs(f.parent, exist_ok=True)
 
     for i in range(1, num_steps + 1):
-        attack_success = ""
-        attack_gen_str = ""
         try:
             input_ids = suffix_manager.get_input_ids(adv_string=adv_suffix).to(device)
             control_slice = suffix_manager._control_slice
-            target_slice = suffix_manager._target_slice
-            coordinate_grad, attn_map ,target_str, pred_str = token_gradients(
+            target_slice  = suffix_manager._target_slice
+            coordinate_grad, attn_suffix_map ,target_str, pred_str = token_gradients(
                 model, input_ids,
                 control_slice,
                 target_slice,
                 suffix_manager._loss_slice,tokenizer
             )
-            selected_pos, selected_rank, pos_prob, rk_prob = None,None,None,None
+            selected_pos, pos_prob = guide_head(coordinate_grad,attn_suffix_map, batch_size)
             with torch.no_grad():
                 top_k = args.top_k
                 adv_suffix_tokens = input_ids[control_slice].to(device)
@@ -278,13 +326,12 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
                 new_adv_suffix_toks  = sample_control(
                     adv_suffix_tokens, coordinate_grad,
                     selected_pos = selected_pos,  # 直接传
-                    selected_rank = selected_rank,  # 直接传
+                 #   selected_rank = selected_rank,  # 直接传
                     batch_size=batch_size, topk=top_k,
                     not_allowed_tokens=not_allowed_tokens
-
                 )
                 unique_count = len(torch.unique(new_adv_suffix_toks, dim=0))
-                print(f"        生成了 {batch_size} 条，不重复数量：{unique_count}")
+                print(f"生成了 {batch_size} 条，不重复数量：{unique_count}")
                 new_adv_suffix = get_filtered_cands(
                     tokenizer,
                     new_adv_suffix_toks,
@@ -314,33 +361,46 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
             ce_loss = losses[best_ce_id].item()
             best_new_adv_suffix = new_adv_suffix[best_ce_id]
             adv_suffix = best_new_adv_suffix
-            all_batch_ce_losses = losses.detach().cpu().mean().item()  # ✅ 整批平均 loss
 
-            train_is_success = not any([prefix in pred_str for prefix in test_prefixes])
-            if i % 10 == 0:
-                prompt = suffix_manager.instruction
-                suffix = adv_suffix
-                attack_success, attack_gen_str = check_for_attack_success(model,tokenizer,test_prefixes=test_prefixes,
-                                                                          prompt=prompt,
-                                                                          suffix=suffix)
-                # ===================== 【新加的输出】=====================
-                print(f"\n====== [ID {args.id}] Step {i} 真实攻击检测 ======")
-                print(f"✅ 攻击成功: {attack_success}")
-                print(f"📝 模型生成: {attack_gen_str}")
-                print(f"🔒 当前最优后缀: {repr(adv_suffix)}")
-                print("=" * 60)
-                # ======================================================
-            # 日志
+            all_batch_ce_losses= losses.detach().cpu().mean().item()  # ✅ 整批平均 loss
+
+            is_success = not any([prefix in pred_str for prefix in test_prefixes])
+            # ====================== 训练时直接用，不再重复 forward ======================
+            # ====================== ✅ 最终 100% 正确策略梯度 ======================
+            opt_guide.zero_grad()
+            # 1. 奖励（越小的loss → 越大的奖励）
+            reward = -losses.detach()  # shape [B]
+
+            #pos_log_prob = torch.log(pos_prob[0, selected_pos] + 1e-8)  # [B]
+            pos_log_prob = torch.log(pos_prob[selected_pos] + 1e-8)
+            # 3. 联合动作概率（核心！必须相加）
+           # total_log_prob = pos_log_prob + rk_log_prob
+
+            # 改成：只学位置，rank 放弃学习
+            total_log_prob = pos_log_prob
+            # [B]
+            # 4. 策略梯度（唯一正确公式）
+            total_loss = -(total_log_prob * reward).mean()
+            # 反向传播
+            total_loss.backward()
+            opt_guide.step()
+            # 早停
+            if args.early_stop:
+                if i >= 50:
+                    success_count = success_count + 1 if is_success else 0
+                    if success_count >= early_stop_threshold:
+                        print(f"🎉 连续 {early_stop_threshold} 次成功，提前停止！")
+                        break
+                else:
+                    success_count = 0
             log_entry = {
                 "step": i,
                 "optimize_target": args.loss_type,
                 "ce_loss": ce_loss,
-                "all_batch_ce_losses_mean": all_batch_ce_losses,  # ✅ 整批平均 loss
+                "all_batch_ce_losses_mean":all_batch_ce_losses,  # ✅ 整批平均 loss
                 "top_k":top_k,
-                "train_gen_str": pred_str,
-                "train_is_success":train_is_success,
-                "attack_success": attack_success,
-                "attack_gen_str": attack_gen_str,
+                "gen_str": pred_str,
+                "attack_success": is_success,
                 "best_adv_suffix": adv_suffix,
                 "current_suffix": best_new_adv_suffix,
                 "target": suffix_manager.target,
@@ -348,9 +408,9 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
                 "simple_unique_count":unique_count
             }
             log_dict.append(log_entry)
-            print(f"id {args.id} | Step {i:2d} | ce_loss: {ce_loss}|" f"train_is_success:{train_is_success}")
-            if attack_success:
-                return log_dict
+            print(f"id {args.id} | Step {i:2d} | MLP Loss: {total_loss.item():.6f}| ce_loss: {ce_loss}|" f"Success:{is_success}")
+            print("pos选的位置：", sorted(selected_pos.cpu().tolist()))
+           # print("rank选择：", sorted(selected_rank.cpu().tolist()))
         except Exception as e:
             trace_info = traceback.format_exc()
             print(f"\n❌ Step {i} 错误详情：\n{trace_info}")
@@ -592,75 +652,85 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="")
     parser.add_argument('--model_path', type=str, default=r"D:\Model\Llama-2-7b-chat-hf")
     parser.add_argument('--device', type=int, default=0)
-    #parser.add_argument('--id', type=int, default=1)
+    parser.add_argument('--id', type=int, default=1)
     parser.add_argument('--behaviors_config', type=str, default="./data/behaviors_config.json")
     parser.add_argument('--output_path', type=str,
                         default=f'./output/{datetime.datetime.now().strftime("%Y%m%d-%H%M%S")}')
     parser.add_argument('--batch_size', type=int, default=16)
     parser.add_argument('--top_k', type=int, default=128)
     parser.add_argument('--num_steps', type=int, default=200)
-    #parser.add_argument('--early_stop', type=bool, default=False)
+    parser.add_argument('--early_stop', type=bool, default=False)
     parser.add_argument('--loss_type', type=str, default="cross_entropy", choices=["cross_entropy", "cosine", "contrast"])
     parser.add_argument('--use_ppl_filter', type=lambda x: x.lower() == 'true', default=False)
     parser.add_argument('--str_init',  type=str, default="! ! ! ! ! ! ! ! ! ! ! ! ! ! ! ! ! ! ! !")
+    parser.add_argument('--stick_steps', type=int, default=3)
+    parser.add_argument('--use_multi_target', type=lambda x: x.lower() == 'true', default=False)
+    parser.add_argument('--use_contrast_loss', type=lambda x: x.lower() == 'true', default=False)
 
-
-    parser.add_argument('--start_id', type=int, default=1)  # 新增
-    parser.add_argument('--end_id', type=int, default=50)  # 新增
 
     args = parser.parse_args()
     set_seed(42)
     device = f"cuda:{args.device}" if torch.cuda.is_available() else "cpu"
     os.environ["CUDA_VISIBLE_DEVICES"] = str(args.device)
+
+    # 加载配置
+    behavior_config = yaml.load(open(args.behaviors_config, 'r', encoding='utf-8'), Loader=yaml.FullLoader)[args.id - 1]
+    user_prompt = behavior_config["behaviour"]
+    target = behavior_config["target"]
+    adv_string_init = args.str_init
+
     model, tokenizer = load_model_and_tokenizer(args.model_path,
                                                 low_cpu_mem_usage=True,
                                                 use_cache=False,
                                                 attn_implementation="eager",
                                                 device=device)
     conv_template = load_conversation_template(template_name)
-    # ========== 循环运行多个样本 ==========
-    for data_id in range(args.start_id, args.end_id + 1):
-        try:
-            args.id = data_id
-            behavior_config = yaml.load(open(args.behaviors_config, 'r', encoding='utf-8'), Loader=yaml.FullLoader)[data_id - 1]
-            user_prompt = behavior_config["behaviour"]
-            target = behavior_config["target"]
-            adv_string_init = args.str_init
-            suffix_manager = SuffixManager(
-                tokenizer=tokenizer,
-                conv_template=conv_template,
-                instruction=user_prompt,
-                target=target,
-                adv_string=adv_string_init
-            )
-            suffix_manager.get_prompt(adv_string=adv_string_init)
-            print("               🚀 Experiment Arguments")
-            print("=" * 50)
-            arg_items = [
-                ("Device", f"cuda:{args.device}"),
-                ("ID", data_id),
-                ("Behaviors Config", args.behaviors_config),
-                ("Output Path", args.output_path),
-                ("Batch Size", args.batch_size),
-                ("Top K", args.top_k),
-                ("Num Steps", args.num_steps),
-                ("Loss Type", args.loss_type),
-                ("Init Suffix", adv_string_init),
-            ]
-            for k, v in arg_items:
-                print(f"{k:<22} : {v}")
-            print("=" * 50)
+    suffix_manager = SuffixManager(
+        tokenizer=tokenizer,
+        conv_template=conv_template,
+        instruction=user_prompt,
+        target=target,
+        adv_string=adv_string_init
+    )
+    suffix_manager.get_prompt(adv_string=adv_string_init)
+    # =============================================================================
+    # 🔥 加在这里：初始化引导头
+    # =============================================================================
 
-            start = time.time()
-            log_dict = minimal_gcg_attack(
-                model=model, tokenizer=tokenizer, suffix_manager=suffix_manager,
-                adv_string_init=adv_string_init, num_steps=args.num_steps,
-                device=device, test_prefixes=test_prefixes, args=args
-            )
-        except Exception as e:
-            print(f"ID {args.id} 失败，跳过：{e}")
-            continue
-        gc.collect()
-        # ✅ 修复：正确计算耗时
-        cost_time = time.time() - start
-        print(f"\n✅ 样本 {args.id} 实验完成，耗时 {cost_time:.2f} 秒！日志已保存，{args} ")
+
+    print(f"\n启动对比实验 | 优化目标: {args.loss_type} | PPL Filter: {args.use_ppl_filter}| INIT: {adv_string_init} | use_multi_target: {args.use_multi_target}\n")
+    print("               🚀 Experiment Arguments")
+    print("=" * 50)
+
+
+    arg_items = [
+        ("Model Path", args.model_path),
+        ("Device", f"cuda:{args.device}"),
+        ("ID", args.id),
+        ("Behaviors Config", args.behaviors_config),
+        ("Output Path", args.output_path),
+        ("Batch Size", args.batch_size),
+        ("Top K", args.top_k),
+        ("Num Steps", args.num_steps),
+        ("Early Stop", args.early_stop),
+        ("Loss Type", args.loss_type),
+        ("Use PPL Filter", args.use_ppl_filter),
+        ("Init Suffix", adv_string_init),
+        ("Stick Steps", args.stick_steps),
+    ]
+    for k, v in arg_items:
+        print(f"{k:<22} : {v}")
+    print("=" * 50)
+
+    start = time.time()
+    log_dict = minimal_gcg_attack(
+        model=model, tokenizer=tokenizer, suffix_manager=suffix_manager,
+        adv_string_init=adv_string_init, num_steps=args.num_steps,
+        device=device, test_prefixes=test_prefixes, args=args
+    )
+
+    del model, tokenizer
+    gc.collect()
+    # ✅ 修复：正确计算耗时
+    cost_time = time.time() - start
+    print(f"\n✅ 样本 {args.id} 实验完成，耗时 {cost_time:.2f} 秒！日志已保存，{args} ")
