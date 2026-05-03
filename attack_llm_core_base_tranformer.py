@@ -128,7 +128,7 @@ import torch
 import torch.nn as nn
 
 class GradPolicyCNN(nn.Module):
-    def __init__(self, suffix_len, vocab_size, topk, hidden_dim=64):
+    def __init__(self, suffix_len, vocab_size, topk, hidden_dim=128):
         super().__init__()
         self.suffix_len = suffix_len
         self.vocab_size = vocab_size
@@ -156,7 +156,7 @@ class GradPolicyCNN(nn.Module):
         )
 
         self.pos_head = nn.Linear(suffix_len * 2, 1)
-        self.rank_head = nn.Linear(suffix_len * 2, topk)
+        #self.rank_head = nn.Linear(suffix_len * 2, topk)
 
     def forward(self, grad, attn_suffix, batch_size, temp=1.0):
         dtype = self.grad_conv[0].weight.dtype
@@ -182,14 +182,14 @@ class GradPolicyCNN(nn.Module):
         selected_pos = torch.multinomial(pos_prob, batch_size, replacement=True)
 
         # -------------------------- 5. 预测token排名 --------------------------
-        global_h = h.mean(dim=0)
-        rank_logit = self.rank_head(global_h)
-        rank_prob = torch.softmax(rank_logit / temp, dim=-1)
-        selected_rank = torch.multinomial(rank_prob, batch_size, replacement=True)
+        # global_h = h.mean(dim=0)
+        # rank_logit = self.rank_head(global_h)
+        # rank_prob = torch.softmax(rank_logit / temp, dim=-1)
+        # selected_rank = torch.multinomial(rank_prob, batch_size, replacement=True)
 
-        return selected_pos, selected_rank, pos_prob.unsqueeze(0), rank_prob.unsqueeze(0)
+        return selected_pos,  pos_prob.unsqueeze(0)
 
-def sample_control(control_toks, grad, batch_size, selected_pos, selected_rank,
+def sample_control(control_toks, grad, batch_size, selected_pos,
     topk=256, temp=1.0, not_allowed_tokens=None):
 
     if not_allowed_tokens is not None:
@@ -208,11 +208,11 @@ def sample_control(control_toks, grad, batch_size, selected_pos, selected_rank,
     #print(new_token_pos, selected_pos)
     new_token_pos = selected_pos
 
-    #rand_idx = torch.randint(0, topk, (batch_size, 1), device=grad.device)
-    selected_rank = selected_rank.unsqueeze(-1)
+    rand_idx = torch.randint(0, topk, (batch_size, 1), device=grad.device)
+    #selected_rank = selected_rank.unsqueeze(-1)
 
     #print(rand_idx, selected_rank)
-    rand_idx = selected_rank
+   # rand_idx = selected_rank
 
 
     new_token_val = torch.gather(
@@ -321,7 +321,7 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
                 target_slice,
                 suffix_manager._loss_slice,tokenizer
             )
-            selected_pos, selected_rank, pos_prob, rk_prob = guide_head(coordinate_grad,attn_suffix_map, batch_size)
+            selected_pos, pos_prob = guide_head(coordinate_grad,attn_suffix_map, batch_size)
             with torch.no_grad():
                 top_k = args.top_k
                 adv_suffix_tokens = input_ids[control_slice].to(device)
@@ -329,7 +329,7 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
                 new_adv_suffix_toks  = sample_control(
                     adv_suffix_tokens, coordinate_grad,
                     selected_pos = selected_pos,  # 直接传
-                    selected_rank = selected_rank,  # 直接传
+                 #   selected_rank = selected_rank,  # 直接传
                     batch_size=batch_size, topk=top_k,
                     not_allowed_tokens=not_allowed_tokens
                 )
@@ -375,9 +375,13 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
             reward = -losses.detach()  # shape [B]
 
             pos_log_prob = torch.log(pos_prob[0, selected_pos] + 1e-8)  # [B]
-            rk_log_prob = torch.log(rk_prob[0, selected_rank] + 1e-8)  # [B]
+            #rk_log_prob = torch.log(rk_prob[0, selected_rank] + 1e-8)  # [B]
             # 3. 联合动作概率（核心！必须相加）
-            total_log_prob = pos_log_prob + rk_log_prob  # [B]
+           # total_log_prob = pos_log_prob + rk_log_prob
+
+            # 改成：只学位置，rank 放弃学习
+            total_log_prob = pos_log_prob
+            # [B]
             # 4. 策略梯度（唯一正确公式）
             total_loss = -(total_log_prob * reward).mean()
             # 反向传播
@@ -409,7 +413,7 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
             log_dict.append(log_entry)
             print(f"id {args.id} | Step {i:2d} | CNN Loss: {total_loss.item():.6f}| ce_loss: {ce_loss}|" f"Success:{is_success}")
             print("pos选的位置：", sorted(selected_pos.cpu().tolist()))
-            print("rank选择：", sorted(selected_rank.cpu().tolist()))
+           # print("rank选择：", sorted(selected_rank.cpu().tolist()))
         except Exception as e:
             trace_info = traceback.format_exc()
             print(f"\n❌ Step {i} 错误详情：\n{trace_info}")
