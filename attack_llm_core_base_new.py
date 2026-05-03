@@ -110,84 +110,9 @@ def token_gradients(model, input_ids, input_slice, target_slice, loss_slice, tok
     one_hot_grad = one_hot.grad.clone()
     grad_l2 = one_hot_grad / one_hot_grad.norm(dim=-1, keepdim=True)
     # 返回归一化后的梯度：指导对抗Token的优化方向
-    attn_map_cl = attn_map.detach().clone()
+    attn_map = attn_map.detach().clone()
+    return grad_l2, attn_map,target_str, pred_str
 
-    # 截取：后缀 ↔ 后缀 的 attention
-    suffix_start = input_slice.start
-    suffix_end = input_slice.stop
-
-    attn_suffix_map = attn_map_cl[
-        suffix_start:suffix_end,
-        suffix_start:suffix_end
-    ]
-
-    return grad_l2, attn_suffix_map,target_str, pred_str
-
-
-import torch
-import torch.nn as nn
-
-class GradPolicyCNN(nn.Module):
-    def __init__(self, suffix_len, vocab_size, topk, hidden_dim=64):
-        super().__init__()
-        self.suffix_len = suffix_len
-        self.vocab_size = vocab_size
-        self.hidden_dim = hidden_dim
-
-        # ====================== 梯度分支 ======================
-
-        # 2. 位置维度1D卷积：提取相邻位置梯度变化、局部敏感区
-        self.grad_conv = nn.Sequential(
-            nn.Conv1d(vocab_size, hidden_dim, kernel_size=3, padding=1),
-            nn.GELU(),
-            nn.Conv1d(hidden_dim, suffix_len, kernel_size=3, padding=1),
-            nn.GELU(),
-        )
-
-        # ====================== 注意力分支 ======================
-        # 仅线性降维，不做卷积！保留后缀内部原生注意力信息
-        #self.attn_proj = nn.Linear(suffix_len, hidden_dim)
-
-        # ====================== 逐位置融合 ======================
-        # 正确
-        self.fusion = nn.Sequential(
-            nn.Linear(suffix_len * 3, suffix_len * 2),
-            nn.GELU()
-        )
-
-        self.pos_head = nn.Linear(suffix_len * 2, 1)
-        self.rank_head = nn.Linear(suffix_len * 2, topk)
-
-    def forward(self, grad, attn_suffix, batch_size, temp=1.0):
-        dtype = self.grad_conv[0].weight.dtype
-        grad = grad.to(dtype)
-        attn_suffix = attn_suffix.to(dtype)
-
-        # -------------------------- 1. 梯度 CNN --------------------------
-        grad_feat = grad.permute(1, 0).unsqueeze(0)  # [1, vocab_size, L]
-        grad_feat = self.grad_conv(grad_feat)  # [1, suffix_len, L]
-        grad_feat = grad_feat.squeeze(0).permute(1, 0)  # [L, suffix_len]
-
-        # -------------------------- 2. 注意力：完全不处理 --------------------------
-        attn_feat = attn_suffix  # [L, suffix_len]
-
-        # -------------------------- 3. 逐位置融合（核心） --------------------------
-        mul_feat = grad_feat * attn_feat
-        fuse_feat = torch.cat([grad_feat, attn_feat, mul_feat], dim=-1)
-        h = self.fusion(fuse_feat)
-
-        # -------------------------- 4. 预测位置 --------------------------
-        pos_logit = self.pos_head(h).squeeze(-1)
-        pos_prob = torch.softmax(pos_logit / temp, dim=-1)
-        selected_pos = torch.multinomial(pos_prob, batch_size, replacement=True)
-
-        # -------------------------- 5. 预测token排名 --------------------------
-        global_h = h.mean(dim=0)
-        rank_logit = self.rank_head(global_h)
-        rank_prob = torch.softmax(rank_logit / temp, dim=-1)
-        selected_rank = torch.multinomial(rank_prob, batch_size, replacement=True)
-
-        return selected_pos, selected_rank, pos_prob.unsqueeze(0), rank_prob.unsqueeze(0)
 
 def sample_control(control_toks, grad, batch_size, selected_pos, selected_rank,
     topk=256, temp=1.0, not_allowed_tokens=None):
@@ -199,20 +124,20 @@ def sample_control(control_toks, grad, batch_size, selected_pos, selected_rank,
     control_toks = control_toks.to(grad.device)
 
     original_control_toks = control_toks.repeat(batch_size, 1)
-    # new_token_pos = torch.arange(
-    #     0,
-    #     len(control_toks),
-    #     len(control_toks) / batch_size,
-    #     device=grad.device
-    # ).type(torch.int64)
+    new_token_pos = torch.arange(
+        0,
+        len(control_toks),
+        len(control_toks) / batch_size,
+        device=grad.device
+    ).type(torch.int64)
     #print(new_token_pos, selected_pos)
-    new_token_pos = selected_pos
 
-    #rand_idx = torch.randint(0, topk, (batch_size, 1), device=grad.device)
-    selected_rank = selected_rank.unsqueeze(-1)
 
-    #print(rand_idx, selected_rank)
-    rand_idx = selected_rank
+    rand_idx = torch.randint(0, topk, (batch_size, 1), device=grad.device)
+
+
+
+
 
 
     new_token_val = torch.gather(
@@ -286,9 +211,9 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
     current_target_index =  0
     vocab_size = model.config.vocab_size
     batch_size = args.batch_size
-    guide_head = GradPolicyCNN(suffix_len, vocab_size, args.top_k).to(device)
+    #guide_head = GradPolicyCNN(suffix_len, vocab_size, args.top_k).to(device)
     # 核心：自动跟随梯度输入的 dtype，彻底杜绝精度冲突
-    opt_guide = torch.optim.AdamW(guide_head.parameters(), lr=1e-4)
+    #opt_guide = torch.optim.Adam(guide_head.parameters(), lr=1e-4)
     not_allowed_tokens = None if allow_non_ascii else get_nonascii_toks(tokenizer)
     adv_suffix = adv_string_init
     log_dict = []
@@ -296,10 +221,10 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
     success_count = 0
     early_stop_threshold = 5
 
-    ppl_suffix =  ""
-    mu = ""
+    ppl_suffix = "ppl" if args.use_ppl_filter else ""
+    mu = "multi" if args.use_multi_target else ""
     con_loss = "contrast" if args.use_contrast_loss else ""
-    sample_method = "cnn"
+    sample_method = ""
 
 
     submission_json_file = pathlib.Path(
@@ -314,14 +239,14 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
         try:
             input_ids = suffix_manager.get_input_ids(adv_string=adv_suffix).to(device)
             control_slice = suffix_manager._control_slice
-            target_slice  = suffix_manager._target_slice
-            coordinate_grad, attn_suffix_map ,target_str, pred_str = token_gradients(
+            target_slice = suffix_manager._target_slice
+            coordinate_grad, attn_map ,target_str, pred_str = token_gradients(
                 model, input_ids,
                 control_slice,
                 target_slice,
                 suffix_manager._loss_slice,tokenizer
             )
-            selected_pos, selected_rank, pos_prob, rk_prob = guide_head(coordinate_grad,attn_suffix_map, batch_size)
+            selected_pos, selected_rank, pos_prob, rk_prob = None,None,None,None
             with torch.no_grad():
                 top_k = args.top_k
                 adv_suffix_tokens = input_ids[control_slice].to(device)
@@ -332,6 +257,7 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
                     selected_rank = selected_rank,  # 直接传
                     batch_size=batch_size, topk=top_k,
                     not_allowed_tokens=not_allowed_tokens
+
                 )
                 unique_count = len(torch.unique(new_adv_suffix_toks, dim=0))
                 print(f"生成了 {batch_size} 条，不重复数量：{unique_count}")
@@ -365,24 +291,11 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
             best_new_adv_suffix = new_adv_suffix[best_ce_id]
             adv_suffix = best_new_adv_suffix
 
-            all_batch_ce_losses= losses.detach().cpu().mean().item()  # ✅ 整批平均 loss
+            all_batch_ce_losses = losses.detach().cpu().mean().item()  # ✅ 整批平均 loss
 
             is_success = not any([prefix in pred_str for prefix in test_prefixes])
-            # ====================== 训练时直接用，不再重复 forward ======================
-            # ====================== ✅ 最终 100% 正确策略梯度 ======================
-            opt_guide.zero_grad()
-            # 1. 奖励（越小的loss → 越大的奖励）
-            reward = -losses.detach()  # shape [B]
 
-            pos_log_prob = torch.log(pos_prob[0, selected_pos] + 1e-8)  # [B]
-            rk_log_prob = torch.log(rk_prob[0, selected_rank] + 1e-8)  # [B]
-            # 3. 联合动作概率（核心！必须相加）
-            total_log_prob = pos_log_prob + rk_log_prob  # [B]
-            # 4. 策略梯度（唯一正确公式）
-            total_loss = -(total_log_prob * reward).mean()
-            # 反向传播
-            total_loss.backward()
-            opt_guide.step()
+
             # 早停
             if args.early_stop:
                 if i >= 50:
@@ -392,11 +305,12 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
                         break
                 else:
                     success_count = 0
+            # 日志
             log_entry = {
                 "step": i,
                 "optimize_target": args.loss_type,
                 "ce_loss": ce_loss,
-                "all_batch_ce_losses_mean":all_batch_ce_losses,  # ✅ 整批平均 loss
+                "all_batch_ce_losses_mean": all_batch_ce_losses,  # ✅ 整批平均 loss
                 "top_k":top_k,
                 "gen_str": pred_str,
                 "attack_success": is_success,
@@ -407,9 +321,9 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
                 "simple_unique_count":unique_count
             }
             log_dict.append(log_entry)
-            print(f"id {args.id} | Step {i:2d} | CNN Loss: {total_loss.item():.6f}| ce_loss: {ce_loss}|" f"Success:{is_success}")
-            print("pos选的位置：", sorted(selected_pos.cpu().tolist()))
-            print("rank选择：", sorted(selected_rank.cpu().tolist()))
+            print(f"id {args.id} | Step {i:2d} | ce_loss: {ce_loss}|" f"Success:{is_success}")
+#$            print("pos选的位置：", sorted(selected_pos.cpu().tolist()))
+#            print("rank选择：", sorted(selected_rank.cpu().tolist()))
         except Exception as e:
             trace_info = traceback.format_exc()
             print(f"\n❌ Step {i} 错误详情：\n{trace_info}")
@@ -657,7 +571,7 @@ if __name__ == '__main__':
                         default=f'./output/{datetime.datetime.now().strftime("%Y%m%d-%H%M%S")}')
     parser.add_argument('--batch_size', type=int, default=16)
     parser.add_argument('--top_k', type=int, default=128)
-    parser.add_argument('--num_steps', type=int, default=200)
+    parser.add_argument('--num_steps', type=int, default=500)
     parser.add_argument('--early_stop', type=bool, default=False)
     parser.add_argument('--loss_type', type=str, default="cross_entropy", choices=["cross_entropy", "cosine", "contrast"])
     parser.add_argument('--use_ppl_filter', type=lambda x: x.lower() == 'true', default=False)
