@@ -233,7 +233,6 @@ def get_model_embedding_layer(model):
         raise ValueError("未识别的模型结构，请手动指定嵌入层路径！")
 
 
-
 # 全局配置
 allow_non_ascii = False
 template_name = 'llama-2'
