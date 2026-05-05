@@ -309,7 +309,7 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
     for f in [submission_json_file, log_json_file]:
         if not f.parent.exists():
             os.makedirs(f.parent, exist_ok=True)
-
+    warmup_steps = 10
     for i in range(1, num_steps + 1):
         try:
             input_ids = suffix_manager.get_input_ids(adv_string=adv_suffix).to(device)
@@ -322,6 +322,12 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
                 suffix_manager._loss_slice,tokenizer
             )
             selected_pos, pos_prob = guide_head(coordinate_grad,attn_suffix_map, batch_size)
+            if i <= warmup_steps:
+                suffix_len = coordinate_grad.shape[0]
+                selected_pos = torch.arange(
+                    0, suffix_len, suffix_len / batch_size,
+                    device=device
+                ).type(torch.int64)
             with torch.no_grad():
                 top_k = args.top_k
                 adv_suffix_tokens = input_ids[control_slice].to(device)
@@ -655,13 +661,13 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="")
     parser.add_argument('--model_path', type=str, default=r"D:\Model\Llama-2-7b-chat-hf")
     parser.add_argument('--device', type=int, default=0)
-    parser.add_argument('--id', type=int, default=1)
+    #parser.add_argument('--id', type=int, default=1)
     parser.add_argument('--behaviors_config', type=str, default="./data/behaviors_config.json")
     parser.add_argument('--output_path', type=str,
                         default=f'./output/{datetime.datetime.now().strftime("%Y%m%d-%H%M%S")}')
-    parser.add_argument('--batch_size', type=int, default=16)
-    parser.add_argument('--top_k', type=int, default=128)
-    parser.add_argument('--num_steps', type=int, default=200)
+    parser.add_argument('--batch_size', type=int, default=20)
+    parser.add_argument('--top_k', type=int, default=256)
+    parser.add_argument('--num_steps', type=int, default=500)
     parser.add_argument('--early_stop', type=bool, default=False)
     parser.add_argument('--loss_type', type=str, default="cross_entropy", choices=["cross_entropy", "cosine", "contrast"])
     parser.add_argument('--use_ppl_filter', type=lambda x: x.lower() == 'true', default=False)
@@ -669,71 +675,74 @@ if __name__ == '__main__':
     parser.add_argument('--stick_steps', type=int, default=3)
     parser.add_argument('--use_multi_target', type=lambda x: x.lower() == 'true', default=False)
     parser.add_argument('--use_contrast_loss', type=lambda x: x.lower() == 'true', default=False)
-
-
+    parser.add_argument('--start_id', type=int, default=1)  # 新增
+    parser.add_argument('--end_id', type=int, default=50)  # 新增
     args = parser.parse_args()
     set_seed(42)
     device = f"cuda:{args.device}" if torch.cuda.is_available() else "cpu"
     os.environ["CUDA_VISIBLE_DEVICES"] = str(args.device)
-
-    # 加载配置
-    behavior_config = yaml.load(open(args.behaviors_config, 'r', encoding='utf-8'), Loader=yaml.FullLoader)[args.id - 1]
-    user_prompt = behavior_config["behaviour"]
-    target = behavior_config["target"]
-    adv_string_init = args.str_init
-
     model, tokenizer = load_model_and_tokenizer(args.model_path,
                                                 low_cpu_mem_usage=True,
                                                 use_cache=False,
                                                 attn_implementation="eager",
                                                 device=device)
     conv_template = load_conversation_template(template_name)
-    suffix_manager = SuffixManager(
-        tokenizer=tokenizer,
-        conv_template=conv_template,
-        instruction=user_prompt,
-        target=target,
-        adv_string=adv_string_init
-    )
-    suffix_manager.get_prompt(adv_string=adv_string_init)
-    # =============================================================================
-    # 🔥 加在这里：初始化引导头
-    # =============================================================================
-
-
-    print(f"\n启动对比实验 | 优化目标: {args.loss_type} | PPL Filter: {args.use_ppl_filter}| INIT: {adv_string_init} | use_multi_target: {args.use_multi_target}\n")
-    print("               🚀 Experiment Arguments")
-    print("=" * 50)
-
-
-    arg_items = [
-        ("Model Path", args.model_path),
-        ("Device", f"cuda:{args.device}"),
-        ("ID", args.id),
-        ("Behaviors Config", args.behaviors_config),
-        ("Output Path", args.output_path),
-        ("Batch Size", args.batch_size),
-        ("Top K", args.top_k),
-        ("Num Steps", args.num_steps),
-        ("Early Stop", args.early_stop),
-        ("Loss Type", args.loss_type),
-        ("Use PPL Filter", args.use_ppl_filter),
-        ("Init Suffix", adv_string_init),
-        ("Stick Steps", args.stick_steps),
-    ]
-    for k, v in arg_items:
-        print(f"{k:<22} : {v}")
-    print("=" * 50)
-
-    start = time.time()
-    log_dict = minimal_gcg_attack(
-        model=model, tokenizer=tokenizer, suffix_manager=suffix_manager,
-        adv_string_init=adv_string_init, num_steps=args.num_steps,
-        device=device, test_prefixes=test_prefixes, args=args
-    )
-
+    model_name = os.path.basename(args.model_path)
+    # 🔥 拼接你要的输出路径（完全不写死）
+    output_path = os.path.join(f"{model_name}_result", f'base_{datetime.datetime.now().strftime("%Y%m%d-%H%M%S")}')
+    args.output_path = output_path
+    for data_id in range(args.start_id, args.end_id + 1):
+        try:
+            # 加载配置
+            behavior_config = yaml.load(open(args.behaviors_config, 'r', encoding='utf-8'), Loader=yaml.FullLoader)[
+                data_id - 1]
+            user_prompt = behavior_config["behaviour"]
+            target = behavior_config["target"]
+            adv_string_init = args.str_init
+            suffix_manager = SuffixManager(
+                tokenizer=tokenizer,
+                conv_template=conv_template,
+                instruction=user_prompt,
+                target=target,
+                adv_string=adv_string_init
+            )
+            suffix_manager.get_prompt(adv_string=adv_string_init)
+            # =============================================================================
+            # 🔥 加在这里：初始化引导头
+            # =============================================================================
+            print(f"\n启动对比实验 | 优化目标: {args.loss_type} | PPL Filter: {args.use_ppl_filter}| INIT: {adv_string_init} | use_multi_target: {args.use_multi_target}\n")
+            print("               🚀 Experiment Arguments")
+            print("=" * 50)
+            arg_items = [
+                ("Model Path", args.model_path),
+                ("Device", f"cuda:{args.device}"),
+                ("ID", args.id),
+                ("Behaviors Config", args.behaviors_config),
+                ("Output Path", args.output_path),
+                ("Batch Size", args.batch_size),
+                ("Top K", args.top_k),
+                ("Num Steps", args.num_steps),
+                ("Early Stop", args.early_stop),
+                ("Loss Type", args.loss_type),
+                ("Use PPL Filter", args.use_ppl_filter),
+                ("Init Suffix", adv_string_init),
+                ("Stick Steps", args.stick_steps),
+            ]
+            for k, v in arg_items:
+                print(f"{k:<22} : {v}")
+            print("=" * 50)
+            start = time.time()
+            log_dict = minimal_gcg_attack(
+                model=model, tokenizer=tokenizer, suffix_manager=suffix_manager,
+                adv_string_init=adv_string_init, num_steps=args.num_steps,
+                device=device, test_prefixes=test_prefixes, args=args
+            )
+            gc.collect()
+            # ✅ 修复：正确计算耗时
+            cost_time = time.time() - start
+            print(f"\n✅ 样本 {args.id} 实验完成，耗时 {cost_time:.2f} 秒！日志已保存，{args} ")
+        except Exception as e:
+            print(f"ID {args.id} 失败，跳过：{e}")
+        gc.collect()
+        # ✅ 修复：正确计算耗时
     del model, tokenizer
-    gc.collect()
-    # ✅ 修复：正确计算耗时
-    cost_time = time.time() - start
-    print(f"\n✅ 样本 {args.id} 实验完成，耗时 {cost_time:.2f} 秒！日志已保存，{args} ")
