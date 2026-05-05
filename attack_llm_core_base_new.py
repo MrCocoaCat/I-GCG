@@ -17,7 +17,7 @@ import traceback
 import linecache
 import numpy as np
 import random
-
+from collections import Counter
 
 # 修复路径配置逻辑
 repo_root = os.getenv("LLM_ATTACKS_ROOT")
@@ -165,12 +165,13 @@ def sample_control(control_toks, grad, batch_size ,topk=256, temp=1.0, not_allow
         device=grad.device
     )
     rand_idx = torch.randint(0, topk, (batch_size, 1), device=grad.device)
+    selected_rank = rand_idx.squeeze(1).cpu().tolist()  # ✅ 正确获取排名
     new_token_val = torch.gather(
         top_indices[new_token_pos], 1,
         rand_idx
     )
     new_control_toks = original_control_toks.scatter_(1, new_token_pos.unsqueeze(-1), new_token_val)
-    return new_control_toks
+    return new_control_toks, new_token_pos.cpu().tolist(), new_token_val.cpu().tolist(), selected_rank
 
 # 核心：适配所有主流LLM的嵌入层获取逻辑
 def get_model_embedding_layer(model):
@@ -244,7 +245,7 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
         if not f.parent.exists():
             os.makedirs(f.parent, exist_ok=True)
     global_best_suffix = ""
-    for i in range(1, num_steps + 1):
+    for i in range(num_steps):
         global_best_loss = inf
         attack_success = ""
         attack_gen_str = ""
@@ -263,11 +264,13 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
                 top_k = args.top_k
                 adv_suffix_tokens = input_ids[control_slice].to(device)
                 # 🔥 传入位置权重（位置选择指导）
-                new_adv_suffix_toks  = sample_control(
+                new_adv_suffix_toks, sel_pos_list, sel_tok_list, sel_rank_list  = sample_control(
                     adv_suffix_tokens, coordinate_grad,
                     batch_size=batch_size, topk=top_k,
                     not_allowed_tokens=not_allowed_tokens
                 )
+                pos_count = dict(Counter(sel_pos_list))
+                rank_count = dict(Counter(sel_rank_list))
                 unique_count = len(torch.unique(new_adv_suffix_toks, dim=0))
                 #print(f"        生成了 {batch_size} 条，不重复数量：{unique_count}")
                 new_adv_suffix = get_filtered_cands(
@@ -321,7 +324,9 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
                 "global_best_loss":global_best_loss,
                 "global_best_suffix": global_best_suffix,
                 "target": suffix_manager.target,
-                "simple_unique_count":unique_count
+                "simple_unique_count":unique_count,
+                "pos_count": pos_count,
+                "rank_count": rank_count,
             }
             log_dict.append(log_entry)
             print(f"id {args.id} | Step {i:2d} | ce_loss: {ce_loss}|" f"train_is_success:{train_is_success}")
@@ -362,10 +367,9 @@ def set_seed(seed=42):
 
 class SuffixManager:
     """
-        管理 Prompt 构造与 Token 切片定位的核心类，用于精准划分 Prompt 中各功能区域的 Token 范围。
-        核心功能：构造包含指令、对抗后缀、目标输出的完整 Prompt，并定位各部分的 Token 切片。
-        """
-
+    管理 Prompt 构造与 Token 切片定位的核心类，用于精准划分 Prompt 中各功能区域的 Token 范围。
+    核心功能：构造包含指令、对抗后缀、目标输出的完整 Prompt，并定位各部分的 Token 切片。
+    """
     def __init__(self, *, tokenizer, conv_template, instruction, target, adv_string):
         """
         初始化 SuffixManager 实例。
@@ -568,7 +572,7 @@ if __name__ == '__main__':
     parser.add_argument('--behaviors_config', type=str, default="./data/behaviors_config.json")
     parser.add_argument('--output_path', type=str,
                         default=f'./output/{datetime.datetime.now().strftime("%Y%m%d-%H%M%S")}')
-    parser.add_argument('--batch_size', type=int, default=20)
+    parser.add_argument('--batch_size', type=int, default=512)
     parser.add_argument('--top_k', type=int, default=256)
     parser.add_argument('--num_steps', type=int, default=500)
     parser.add_argument('--loss_type', type=str, default="cross_entropy", choices=["cross_entropy", "cosine", "contrast"])

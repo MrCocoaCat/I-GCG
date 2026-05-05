@@ -16,6 +16,8 @@ import linecache
 import numpy as np
 import random
 from cmath import inf
+from collections import Counter
+
 # 修复路径配置逻辑
 repo_root = os.getenv("LLM_ATTACKS_ROOT")
 if not repo_root:
@@ -135,17 +137,20 @@ class GradPolicyCNN(nn.Module):
 
         # ====================== 梯度分支 ======================
 
-        # 2. 位置维度1D卷积：提取相邻位置梯度变化、局部敏感区
+        # ====================== 梯度特征提取 CNN ======================
+        # 输入：[1, vocab_size, L]
+        # 输出：[1, hidden_dim, L]
         self.grad_conv = nn.Sequential(
             nn.Conv1d(vocab_size, hidden_dim, kernel_size=3, padding=1),
             nn.GELU(),
-            nn.Conv1d(hidden_dim, suffix_len, kernel_size=3, padding=1),
+            nn.Conv1d(hidden_dim, hidden_dim, kernel_size=3, padding=1),
             nn.GELU(),
         )
 
-        # ====================== 注意力分支 ======================
-        # 仅线性降维，不做卷积！保留后缀内部原生注意力信息
-        #self.attn_proj = nn.Linear(suffix_len, hidden_dim)
+        # 把 128 维梯度 → 投影到 20 维，和注意力维度对齐
+        self.grad_proj = nn.Linear(hidden_dim, suffix_len)
+        # Token 预测头：用 128 维高维特征直接预测 32000 个词
+        self.token_head = nn.Linear(hidden_dim, vocab_size)
 
         # ====================== 逐位置融合 ======================
         # 正确
@@ -153,7 +158,6 @@ class GradPolicyCNN(nn.Module):
             nn.Linear(suffix_len * 3, suffix_len * 2),
             nn.GELU()
         )
-
         self.pos_head = nn.Linear(suffix_len * 2, 1)
 
 
@@ -161,30 +165,39 @@ class GradPolicyCNN(nn.Module):
         dtype = self.grad_conv[0].weight.dtype
         grad = grad.to(dtype)
         attn_suffix = attn_suffix.to(dtype)
-        # -------------------------- 1. 梯度 CNN --------------------------
+        # -------------------------- 1. 梯度 CNN 处理 --------------------------
+        # 输入 grad 形状：[L, vocab_size]
+        # 交换维度 + 增加 batch 维 → 变成 Conv1d 需要的格式：[1, vocab_size, L]
         grad_feat = grad.permute(1, 0).unsqueeze(0)  # [1, vocab_size, L]
-        grad_feat = self.grad_conv(grad_feat)  # [1, suffix_len, L]
-        grad_feat = grad_feat.squeeze(0).permute(1, 0)  # [L, suffix_len]
-        # -------------------------- 2. 注意力：完全不处理 --------------------------
-        attn_feat = attn_suffix  # [L, suffix_len]
+        # CNN 提取梯度高维特征 → [1, hidden_dim, L]
+        grad_feat = self.grad_conv(grad_feat)
+        # 去掉 batch 维 + 交换维度 → 变成 [L, hidden_dim]（每个位置 128 维特征）
+        # 这个 grad_128 是信息最完整的特征，用来预测 token
+        grad_128 = grad_feat.squeeze(0).permute(1, 0)
+        # 把 128 维投影到 20 维 → [L, suffix_len]，用于和注意力融合
+        grad_feat = self.grad_proj(grad_128)
+        # -------------------------- 2. 注意力特征 --------------------------
+        attn_feat = attn_suffix # 形状：[L, suffix_len]
         # -------------------------- 3. 逐位置融合（核心） --------------------------
         mul_feat = grad_feat * attn_feat
         fuse_feat = torch.cat([grad_feat, attn_feat, mul_feat], dim=-1)
         h = self.fusion(fuse_feat)
-        # -------------------------- 4. 预测位置 --------------------------
+        # -------------------------- 4. 预测要替换的位置 --------------------------
         pos_logit = self.pos_head(h).squeeze(-1)
         pos_prob = torch.softmax(pos_logit / temp, dim=-1)
         selected_pos = torch.multinomial(pos_prob, batch_size, replacement=True)
-        # -------------------------- 5. 预测token排名 --------------------------
-        # global_h = h.mean(dim=0)
-        # rank_logit = self.rank_head(global_h)
-        # rank_prob = torch.softmax(rank_logit / temp, dim=-1)
-        # selected_rank = torch.multinomial(rank_prob, batch_size, replacement=True)
+        # -------------------------- 5. 预测要替换的 token（32000 维） --------------------------
+        # 用 128 维特征预测所有位置的 token → [L, vocab_size]
+        token_logits = self.token_head(grad_128)  # [L, vocab_size]
+        token_prob = torch.softmax(token_logits / temp, dim=-1) # token 概率
 
-        return selected_pos,  pos_prob.unsqueeze(0)
+        # 选出对应位置的 token
+        selected_token_prob = token_prob[selected_pos]
+        selected_token = torch.multinomial(selected_token_prob, 1).squeeze(-1)
 
-def sample_control(control_toks, grad, batch_size, selected_pos,
-    topk=256, temp=1.0, not_allowed_tokens=None):
+        return selected_pos,  pos_prob.unsqueeze(0), selected_token, token_prob
+
+def sample_control(control_toks, grad, batch_size, selected_pos, topk=256, temp=1.0, not_allowed_tokens=None):
 
     if not_allowed_tokens is not None:
         grad[:, not_allowed_tokens.to(grad.device)] = np.inf
@@ -203,6 +216,7 @@ def sample_control(control_toks, grad, batch_size, selected_pos,
     new_token_pos = selected_pos
 
     rand_idx = torch.randint(0, topk, (batch_size, 1), device=grad.device)
+    selected_rank = rand_idx.squeeze(1).cpu().tolist()  # ✅ 正确获取排名
     #selected_rank = selected_rank.unsqueeze(-1)
     #print(rand_idx, selected_rank)
    # rand_idx = selected_rank
@@ -211,7 +225,7 @@ def sample_control(control_toks, grad, batch_size, selected_pos,
         rand_idx
     )
     new_control_toks = original_control_toks.scatter_(1, new_token_pos.unsqueeze(-1), new_token_val)
-    return new_control_toks
+    return new_control_toks, new_token_pos.cpu().tolist(), new_token_val.cpu().tolist(), selected_rank
 
 # 核心：适配所有主流LLM的嵌入层获取逻辑
 def get_model_embedding_layer(model):
@@ -295,10 +309,12 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
         f'{args.output_path}/submission/{mu}{args.loss_type}{ppl_suffix}_{sample_method}_{args.id}.json')
     log_json_file = pathlib.Path(
         f'{args.output_path}/log/{mu}_{con_loss}_{args.loss_type}_{ppl_suffix}_{sample_method}_{args.id}.json')
+    vis_states = pathlib.Path(
+        f'{args.output_path}/vis_states/{mu}_{con_loss}_{args.loss_type}_{ppl_suffix}_{sample_method}_{args.id}.json')
     for f in [submission_json_file, log_json_file]:
         if not f.parent.exists():
             os.makedirs(f.parent, exist_ok=True)
-    for i in range(1, num_steps + 1):
+    for i in range(num_steps):
         global_best_loss = inf
         attack_success = ""
         attack_gen_str = ""
@@ -318,15 +334,17 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
                 top_k = args.top_k
                 adv_suffix_tokens = input_ids[control_slice].to(device)
                 # 🔥 传入位置权重（位置选择指导）
-                new_adv_suffix_toks  = sample_control(
+                new_adv_suffix_toks, sel_pos_list, sel_tok_list, sel_rank_list  = sample_control(
                     adv_suffix_tokens, coordinate_grad,
                     selected_pos = selected_pos,  # 直接传
                  #   selected_rank = selected_rank,  # 直接传
                     batch_size=batch_size, topk= args.top_k,
                     not_allowed_tokens=not_allowed_tokens
                 )
+                pos_count = dict(Counter(sel_pos_list))
+                rank_count = dict(Counter(sel_rank_list))
                 unique_count = len(torch.unique(new_adv_suffix_toks, dim=0))
-                print(f"生成了 {batch_size} 条，不重复数量：{unique_count}")
+                #print(f"生成了 {batch_size} 条，不重复数量：{unique_count}")
                 new_adv_suffix = get_filtered_cands(
                     tokenizer,
                     new_adv_suffix_toks,
@@ -397,7 +415,9 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
                 "global_best_loss": global_best_loss,
                 "global_best_suffix": global_best_suffix,
                 "target": suffix_manager.target,
-                "simple_unique_count": unique_count
+                "simple_unique_count": unique_count,
+                "pos_count": pos_count,
+                "rank_count": rank_count,
             }
             log_dict.append(log_entry)
             print(f"id {args.id} | Step {i:2d} | CNN Loss: {total_loss.item():.6f}| ce_loss: {ce_loss}")
@@ -408,12 +428,27 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
             print(f"\n❌ Step {i} 错误详情：\n{trace_info}")
             log_dict.append({"step": i, "err": str(e), "use_ppl_filter": args.use_ppl_filter})
             continue
-        del coordinate_grad, input_ids, logits, ids
-        gc.collect()
-        torch.cuda.empty_cache()
         if i % 10 == 0:
             with open(log_json_file, 'w', encoding='utf-8') as f:
                 json.dump(log_dict, f, ensure_ascii=False, indent=2)
+            save_dict = {
+                "step": i,
+                # ========== 外部3大核心矩阵 ==========
+                "attn_suffix_map": attn_suffix_map.detach().cpu(),  # 后缀注意力
+                "coordinate_grad": coordinate_grad.detach().cpu(),  # 梯度矩阵
+                "pos_prob": pos_prob.detach().cpu(),  # 位置选择概率
+                # ========== 小模型内部权重 ==========
+                "conv1_w": guide_head.grad_conv[0].weight.detach().cpu(),
+                "conv2_w": guide_head.grad_conv[2].weight.detach().cpu(),
+                "grad_proj_w": guide_head.grad_proj.weight.detach().cpu(),
+                "fusion_w": guide_head.fusion[0].weight.detach().cpu(),
+                "pos_head_w": guide_head.pos_head.weight.detach().cpu(),
+                "token_head_w": guide_head.token_head.weight.detach().cpu(),
+            }
+            torch.save(save_dict, f"./vis_states/step_{i}.pth")
+        del coordinate_grad, input_ids, logits, ids
+        gc.collect()
+        torch.cuda.empty_cache()
     with open(log_json_file, 'w', encoding='utf-8') as f:
         json.dump(log_dict, f, ensure_ascii=False, indent=2)
     return log_dict
