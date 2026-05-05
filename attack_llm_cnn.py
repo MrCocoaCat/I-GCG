@@ -15,8 +15,7 @@ import traceback
 import linecache
 import numpy as np
 import random
-
-
+from cmath import inf
 # 修复路径配置逻辑
 repo_root = os.getenv("LLM_ATTACKS_ROOT")
 if not repo_root:
@@ -156,31 +155,26 @@ class GradPolicyCNN(nn.Module):
         )
 
         self.pos_head = nn.Linear(suffix_len * 2, 1)
-        #self.rank_head = nn.Linear(suffix_len * 2, topk)
+
 
     def forward(self, grad, attn_suffix, batch_size, temp=1.0):
         dtype = self.grad_conv[0].weight.dtype
         grad = grad.to(dtype)
         attn_suffix = attn_suffix.to(dtype)
-
         # -------------------------- 1. 梯度 CNN --------------------------
         grad_feat = grad.permute(1, 0).unsqueeze(0)  # [1, vocab_size, L]
         grad_feat = self.grad_conv(grad_feat)  # [1, suffix_len, L]
         grad_feat = grad_feat.squeeze(0).permute(1, 0)  # [L, suffix_len]
-
         # -------------------------- 2. 注意力：完全不处理 --------------------------
         attn_feat = attn_suffix  # [L, suffix_len]
-
         # -------------------------- 3. 逐位置融合（核心） --------------------------
         mul_feat = grad_feat * attn_feat
         fuse_feat = torch.cat([grad_feat, attn_feat, mul_feat], dim=-1)
         h = self.fusion(fuse_feat)
-
         # -------------------------- 4. 预测位置 --------------------------
         pos_logit = self.pos_head(h).squeeze(-1)
         pos_prob = torch.softmax(pos_logit / temp, dim=-1)
         selected_pos = torch.multinomial(pos_prob, batch_size, replacement=True)
-
         # -------------------------- 5. 预测token排名 --------------------------
         # global_h = h.mean(dim=0)
         # rank_logit = self.rank_head(global_h)
@@ -210,11 +204,8 @@ def sample_control(control_toks, grad, batch_size, selected_pos,
 
     rand_idx = torch.randint(0, topk, (batch_size, 1), device=grad.device)
     #selected_rank = selected_rank.unsqueeze(-1)
-
     #print(rand_idx, selected_rank)
    # rand_idx = selected_rank
-
-
     new_token_val = torch.gather(
         top_indices[new_token_pos], 1,
         rand_idx
@@ -300,8 +291,7 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
     mu = ""
     con_loss = "contrast" if args.use_contrast_loss else ""
     sample_method = "cnn"
-
-
+    global_best_suffix = ""
     submission_json_file = pathlib.Path(
         f'{args.output_path}/submission/{mu}{args.loss_type}{ppl_suffix}_{sample_method}_{args.id}.json')
     log_json_file = pathlib.Path(
@@ -309,8 +299,10 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
     for f in [submission_json_file, log_json_file]:
         if not f.parent.exists():
             os.makedirs(f.parent, exist_ok=True)
-    warmup_steps = 10
     for i in range(1, num_steps + 1):
+        global_best_loss = inf
+        attack_success = ""
+        attack_gen_str = ""
         try:
             input_ids = suffix_manager.get_input_ids(adv_string=adv_suffix).to(device)
             control_slice = suffix_manager._control_slice
@@ -321,13 +313,8 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
                 target_slice,
                 suffix_manager._loss_slice,tokenizer
             )
-            selected_pos, pos_prob = guide_head(coordinate_grad,attn_suffix_map, batch_size)
-            if i <= warmup_steps:
-                suffix_len = coordinate_grad.shape[0]
-                selected_pos = torch.arange(
-                    0, suffix_len, suffix_len / batch_size,
-                    device=device
-                ).type(torch.int64)
+            # ======================== 正确 Warmup ========================
+            selected_pos, pos_prob = guide_head(coordinate_grad, attn_suffix_map, batch_size)
             with torch.no_grad():
                 top_k = args.top_k
                 adv_suffix_tokens = input_ids[control_slice].to(device)
@@ -336,7 +323,7 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
                     adv_suffix_tokens, coordinate_grad,
                     selected_pos = selected_pos,  # 直接传
                  #   selected_rank = selected_rank,  # 直接传
-                    batch_size=batch_size, topk=top_k,
+                    batch_size=batch_size, topk= args.top_k,
                     not_allowed_tokens=not_allowed_tokens
                 )
                 unique_count = len(torch.unique(new_adv_suffix_toks, dim=0))
@@ -348,18 +335,15 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
                     curr_control=adv_suffix
                 )
                 del adv_suffix_tokens, new_adv_suffix_toks
-
-            # Step 3.4 Compute loss on these candidates and take the argmin.
-            logits, ids = get_logits(model=model,
-                                     tokenizer=tokenizer,
-                                     input_ids=input_ids,
-                                     control_slice=control_slice,
-                                     test_controls=new_adv_suffix,
-                                     return_ids=True,
-                                     batch_size=batch_size)
-
-
-            target_ids = ids[:, target_slice]
+                # Step 3.4 Compute loss on these candidates and take the argmin.
+                logits, ids = get_logits(model=model,
+                                         tokenizer=tokenizer,
+                                         input_ids=input_ids,
+                                         control_slice=control_slice,
+                                         test_controls=new_adv_suffix,
+                                         return_ids=True,
+                                         batch_size=batch_size)
+                target_ids = ids[:, target_slice]
 
             # --------------------- 1. 交叉熵（梯度来源，完全不变） ---------------------
             crit = nn.CrossEntropyLoss(reduction='none')
@@ -373,7 +357,13 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
 
             all_batch_ce_losses= losses.detach().cpu().mean().item()  # ✅ 整批平均 loss
 
-            is_success = not any([prefix in pred_str for prefix in test_prefixes])
+            train_is_success = not any([prefix in pred_str for prefix in test_prefixes])
+            # ===================== 【关键修复】保存全局最优 =====================
+            if ce_loss < global_best_loss:
+                global_best_loss = ce_loss
+                global_best_suffix = best_new_adv_suffix
+            # =================
+            # 日志
             # ====================== 训练时直接用，不再重复 forward ======================
             # ====================== ✅ 最终 100% 正确策略梯度 ======================
             opt_guide.zero_grad()
@@ -393,31 +383,25 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
             # 反向传播
             total_loss.backward()
             opt_guide.step()
-            # 早停
-            if args.early_stop:
-                if i >= 50:
-                    success_count = success_count + 1 if is_success else 0
-                    if success_count >= early_stop_threshold:
-                        print(f"🎉 连续 {early_stop_threshold} 次成功，提前停止！")
-                        break
-                else:
-                    success_count = 0
+            # 日志
             log_entry = {
                 "step": i,
                 "optimize_target": args.loss_type,
                 "ce_loss": ce_loss,
-                "all_batch_ce_losses_mean":all_batch_ce_losses,  # ✅ 整批平均 loss
-                "top_k":top_k,
-                "gen_str": pred_str,
-                "attack_success": is_success,
-                "best_adv_suffix": adv_suffix,
-                "current_suffix": best_new_adv_suffix,
+                "adv_suffix": adv_suffix,
+                "all_batch_ce_losses_mean": all_batch_ce_losses,  # ✅ 整批平均 loss
+                "top_k": top_k,
+                "train_gen_str": pred_str,
+                "train_is_success": train_is_success,
+                #"attack_success": attack_success,
+                #"attack_gen_str": attack_gen_str,
+                "global_best_loss": global_best_loss,
+                "global_best_suffix": global_best_suffix,
                 "target": suffix_manager.target,
-                "current_target_index": str(current_target_index),
-                "simple_unique_count":unique_count
+                "simple_unique_count": unique_count
             }
             log_dict.append(log_entry)
-            print(f"id {args.id} | Step {i:2d} | CNN Loss: {total_loss.item():.6f}| ce_loss: {ce_loss}|" f"Success:{is_success}")
+            print(f"id {args.id} | Step {i:2d} | CNN Loss: {total_loss.item():.6f}| ce_loss: {ce_loss}")
             print("pos选的位置：", sorted(selected_pos.cpu().tolist()))
            # print("rank选择：", sorted(selected_rank.cpu().tolist()))
         except Exception as e:
@@ -665,7 +649,7 @@ if __name__ == '__main__':
     parser.add_argument('--behaviors_config', type=str, default="./data/behaviors_config.json")
     parser.add_argument('--output_path', type=str,
                         default=f'./output/{datetime.datetime.now().strftime("%Y%m%d-%H%M%S")}')
-    parser.add_argument('--batch_size', type=int, default=20)
+    parser.add_argument('--batch_size', type=int, default=512)
     parser.add_argument('--top_k', type=int, default=256)
     parser.add_argument('--num_steps', type=int, default=500)
     parser.add_argument('--early_stop', type=bool, default=False)
@@ -677,6 +661,7 @@ if __name__ == '__main__':
     parser.add_argument('--use_contrast_loss', type=lambda x: x.lower() == 'true', default=False)
     parser.add_argument('--start_id', type=int, default=1)  # 新增
     parser.add_argument('--end_id', type=int, default=50)  # 新增
+    parser.add_argument('--warmup_steps', type=int, default=50)
     args = parser.parse_args()
     set_seed(42)
     device = f"cuda:{args.device}" if torch.cuda.is_available() else "cpu"
@@ -692,6 +677,7 @@ if __name__ == '__main__':
     output_path = os.path.join(f"{model_name}_result", f'base_{datetime.datetime.now().strftime("%Y%m%d-%H%M%S")}')
     args.output_path = output_path
     for data_id in range(args.start_id, args.end_id + 1):
+        args.id = data_id
         try:
             # 加载配置
             behavior_config = yaml.load(open(args.behaviors_config, 'r', encoding='utf-8'), Loader=yaml.FullLoader)[

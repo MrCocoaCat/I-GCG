@@ -1,5 +1,7 @@
 import argparse
 import json
+from cmath import inf
+
 import yaml
 import datetime
 import os
@@ -143,8 +145,7 @@ def check_for_attack_success(model, tokenizer, suffix_manager, suffix: str, test
     jail_broken = not any(p in gen_str for p in test_prefixes)
     return jail_broken, gen_str
 
-def sample_control(control_toks, grad, batch_size, selected_pos, selected_rank,
-    topk=256, temp=1.0, not_allowed_tokens=None):
+def sample_control(control_toks, grad, batch_size ,topk=256, temp=1.0, not_allowed_tokens=None):
     if not_allowed_tokens is not None:
         grad[:, not_allowed_tokens.to(grad.device)] = np.inf
     top_indices = (-grad).topk(topk, dim=1).indices
@@ -227,13 +228,12 @@ def check_input_ids_ppl(model, tokenizer, input_ids):
 
 def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_steps, device, test_prefixes, args):
     # ===================== 多目标私有状态（线程安全）=====================
-
-    current_target_index =  0
     batch_size = args.batch_size
     not_allowed_tokens = None if allow_non_ascii else get_nonascii_toks(tokenizer)
     adv_suffix = adv_string_init
     log_dict = []
-    sample_method = ""
+    sample_method = "radom"
+
 
 
     submission_json_file = pathlib.Path(
@@ -243,10 +243,12 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
     for f in [submission_json_file, log_json_file]:
         if not f.parent.exists():
             os.makedirs(f.parent, exist_ok=True)
-
+    global_best_suffix = ""
     for i in range(1, num_steps + 1):
+        global_best_loss = inf
         attack_success = ""
         attack_gen_str = ""
+
         try:
             input_ids = suffix_manager.get_input_ids(adv_string=adv_suffix).to(device)
             control_slice = suffix_manager._control_slice
@@ -257,15 +259,12 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
                 target_slice,
                 suffix_manager._loss_slice,tokenizer
             )
-            selected_pos, selected_rank, pos_prob, rk_prob = None,None,None,None
             with torch.no_grad():
                 top_k = args.top_k
                 adv_suffix_tokens = input_ids[control_slice].to(device)
                 # 🔥 传入位置权重（位置选择指导）
                 new_adv_suffix_toks  = sample_control(
                     adv_suffix_tokens, coordinate_grad,
-                    selected_pos = selected_pos,  # 直接传
-                    selected_rank = selected_rank,  # 直接传
                     batch_size=batch_size, topk=top_k,
                     not_allowed_tokens=not_allowed_tokens
                 )
@@ -278,16 +277,15 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
                     curr_control=adv_suffix
                 )
                 del adv_suffix_tokens, new_adv_suffix_toks
-
-            # Step 3.4 Compute loss on these candidates and take the argmin.
-            logits, ids = get_logits(model=model,
-                                     tokenizer=tokenizer,
-                                     input_ids=input_ids,
-                                     control_slice=control_slice,
-                                     test_controls=new_adv_suffix,
-                                     return_ids=True,
-                                     batch_size=batch_size)
-            target_ids = ids[:, target_slice]
+                # Step 3.4 Compute loss on these candidates and take the argmin.
+                logits, ids = get_logits(model=model,
+                                         tokenizer=tokenizer,
+                                         input_ids=input_ids,
+                                         control_slice=control_slice,
+                                         test_controls=new_adv_suffix,
+                                         return_ids=True,
+                                         batch_size=batch_size)
+                target_ids = ids[:, target_slice]
 
             # --------------------- 1. 交叉熵（梯度来源，完全不变） ---------------------
             crit = nn.CrossEntropyLoss(reduction='none')
@@ -297,37 +295,32 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
             best_ce_id = losses.argmin()
             ce_loss = losses[best_ce_id].item()
             best_new_adv_suffix = new_adv_suffix[best_ce_id]
+            # 用户每次替换
             adv_suffix = best_new_adv_suffix
-            all_batch_ce_losses = losses.detach().cpu().mean().item()  # ✅ 整批平均 loss
 
+
+            all_batch_ce_losses = losses.detach().cpu().mean().item()  # ✅ 整批平均 loss
             train_is_success = not any([prefix in pred_str for prefix in test_prefixes])
-            # if i % 1 == 0:
-            #     suffix = adv_suffix
-            #     attack_success, attack_gen_str = check_for_attack_success(model,tokenizer,suffix_manager,test_prefixes=test_prefixes,
-            #
-            #                                                               suffix=suffix)
-            #     # ===================== 【新加的输出】=====================
-            #     print(f"\n====== [ID {args.id}] Step {i} 真实攻击检测 ======")
-            #     print(f"✅ 攻击成功: {attack_success}")
-            #     print(f"📝 模型生成: {attack_gen_str}")
-            #     print(f"🔒 当前最优后缀: {repr(adv_suffix)}")
-            #     print("=" * 60)
-            #     # ======================================================
+            # ===================== 【关键修复】保存全局最优 =====================
+            if ce_loss < global_best_loss:
+                global_best_loss = ce_loss
+                global_best_suffix = best_new_adv_suffix
+            # =================
             # 日志
             log_entry = {
                 "step": i,
                 "optimize_target": args.loss_type,
                 "ce_loss": ce_loss,
+                "adv_suffix": adv_suffix,
                 "all_batch_ce_losses_mean": all_batch_ce_losses,  # ✅ 整批平均 loss
                 "top_k":top_k,
                 "train_gen_str": pred_str,
                 "train_is_success":train_is_success,
                 "attack_success": attack_success,
                 "attack_gen_str": attack_gen_str,
-                "best_adv_suffix": adv_suffix,
-                "current_suffix": best_new_adv_suffix,
+                "global_best_loss":global_best_loss,
+                "global_best_suffix": global_best_suffix,
                 "target": suffix_manager.target,
-                "current_target_index": str(current_target_index),
                 "simple_unique_count":unique_count
             }
             log_dict.append(log_entry)
@@ -343,8 +336,6 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
         if i % 10 == 0:
             with open(log_json_file, 'w', encoding='utf-8') as f:
                 json.dump(log_dict, f, ensure_ascii=False, indent=2)
-            # if attack_success:
-            #     return log_dict
     with open(log_json_file, 'w', encoding='utf-8') as f:
         json.dump(log_dict, f, ensure_ascii=False, indent=2)
     return log_dict
@@ -598,7 +589,7 @@ if __name__ == '__main__':
     # ========== 循环运行多个样本 ==========
     model_name = os.path.basename(args.model_path)
     # 🔥 拼接你要的输出路径（完全不写死）
-    output_path = os.path.join(f"{model_name}_result",f'base_{datetime.datetime.now().strftime("%Y%m%d-%H%M%S")}')
+    output_path = os.path.join(f"{model_name}_result",f'base_new_{datetime.datetime.now().strftime("%Y%m%d-%H%M%S")}')
     args.output_path =output_path
     for data_id in range(args.start_id, args.end_id + 1):
         try:
