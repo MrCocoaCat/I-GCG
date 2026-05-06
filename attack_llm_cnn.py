@@ -310,7 +310,10 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
     log_json_file = pathlib.Path(
         f'{args.output_path}/log/{mu}_{con_loss}_{args.loss_type}_{ppl_suffix}_{sample_method}_{args.id}.json')
     vis_states = pathlib.Path(
-        f'{args.output_path}/vis_states/{mu}_{con_loss}_{args.loss_type}_{ppl_suffix}_{sample_method}_{args.id}.json')
+        f'{args.output_path}/vis_states/{mu}_{con_loss}_{args.loss_type}_{ppl_suffix}_{sample_method}_{args.id}'
+    )
+    # 直接创建，不用判断 parent，更干净
+    vis_states.mkdir(parents=True, exist_ok=True)
     for f in [submission_json_file, log_json_file]:
         if not f.parent.exists():
             os.makedirs(f.parent, exist_ok=True)
@@ -372,6 +375,10 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
             best_new_adv_suffix = new_adv_suffix[best_ce_id]
             adv_suffix = best_new_adv_suffix
 
+            # 新增：记录当前最优被选中的位置 & topk 内排名
+            best_sel_pos = sel_pos_list[best_ce_id]
+            best_sel_rank = sel_rank_list[best_ce_id]
+
             all_batch_ce_losses= losses.detach().cpu().mean().item()  # ✅ 整批平均 loss
 
             train_is_success = not any([prefix in pred_str for prefix in test_prefixes])
@@ -418,6 +425,8 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
                 "simple_unique_count": unique_count,
                 "pos_count": pos_count,
                 "rank_count": rank_count,
+                "best_sel_pos": best_sel_pos,
+                "best_sel_rank": best_sel_rank,
             }
             log_dict.append(log_entry)
             print(f"id {args.id} | Step {i:2d} | CNN Loss: {total_loss.item():.6f}| ce_loss: {ce_loss}")
@@ -445,7 +454,8 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
                 "pos_head_w": guide_head.pos_head.weight.detach().cpu(),
                 "token_head_w": guide_head.token_head.weight.detach().cpu(),
             }
-            torch.save(save_dict, f"./vis_states/step_{i}.pth")
+            # torch.save(save_dict, f"./vis_states/step_{i}.pth")
+            torch.save(save_dict, vis_states / f"step_{i}.pth")
         del coordinate_grad, input_ids, logits, ids
         gc.collect()
         torch.cuda.empty_cache()

@@ -32,6 +32,19 @@ from llm_attacks.minimal_gcg.opt_utils import ( get_logits, generate,
 )
 from llm_attacks.minimal_gcg.string_utils import load_conversation_template
 from llm_attacks import get_nonascii_toks
+import subprocess
+# ===================== 获取 Git 版本号 =====================
+def get_git_version(file_path=__file__):
+    try:
+        file_dir = os.path.dirname(os.path.abspath(file_path))
+        cmd = ["git", "log", "-1", "--pretty=format:%H"]
+        commit = subprocess.check_output(cmd, cwd=file_dir, text=True, stderr=subprocess.PIPE).strip()
+        return commit
+    except:
+        return "unknown"
+
+GIT_COMMIT = get_git_version()
+# ============================================================
 
 # ===================== 全局配置（放在函数外面）=====================
 # 根目录
@@ -622,6 +635,7 @@ if __name__ == '__main__':
                 ("Num Steps", args.num_steps),
                 ("Loss Type", args.loss_type),
                 ("Init Suffix", adv_string_init),
+                ("Git Commit", GIT_COMMIT),  # <-- 在这里加上了
             ]
             for k, v in arg_items:
                 print(f"{k:<22} : {v}")
