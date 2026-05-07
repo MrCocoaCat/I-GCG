@@ -258,8 +258,8 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
         if not f.parent.exists():
             os.makedirs(f.parent, exist_ok=True)
     global_best_suffix = ""
+    global_best_loss = inf
     for i in range(num_steps):
-        global_best_loss = inf
         attack_success = ""
         attack_gen_str = ""
 
