@@ -128,7 +128,6 @@ def token_gradients(model, input_ids, input_slice, target_slice, loss_slice, tok
     attn_map = attn_map.detach().clone()
     return grad_l2, attn_map,target_str, pred_str
 
-
 def check_for_attack_success(model, tokenizer, suffix_manager, suffix: str, test_prefixes: list, gen_config=None):
     if gen_config is None:
         gen_config = {
@@ -205,7 +204,6 @@ def get_model_embedding_layer(model):
         print(str(model)[:1000])
         raise ValueError("未识别的模型结构，请手动指定嵌入层路径！")
 
-
 # 全局配置
 allow_non_ascii = False
 template_name = 'llama-2'
@@ -239,22 +237,24 @@ def check_input_ids_ppl(model, tokenizer, input_ids):
             prompt_ppl = torch.exp(loss).item()
     return prompt_ppl
 
-
 def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_steps, device, test_prefixes, args):
     # ===================== 多目标私有状态（线程安全）=====================
     batch_size = args.batch_size
     not_allowed_tokens = None if allow_non_ascii else get_nonascii_toks(tokenizer)
     adv_suffix = adv_string_init
     log_dict = []
+    grad_matrix_log = []  # 新增：存每一步onehot梯度矩阵
+    pos_rank_log = []  # 专门存 (pos, rank) 批次记录
     sample_method = "radom"
-
-
 
     submission_json_file = pathlib.Path(
         f'{args.output_path}/submission/{args.loss_type}_{sample_method}_{args.id}.json')
     log_json_file = pathlib.Path(
         f'{args.output_path}/log/{args.loss_type}_{sample_method}_{args.id}.json')
-    for f in [submission_json_file, log_json_file]:
+    grad_npy_file = pathlib.Path(f'{args.output_path}/grad/{args.loss_type}_{sample_method}_{args.id}_grad.npy')
+    # ===================== 单独保存 pos_rank 日志 =====================
+    pos_rank_file = pathlib.Path(f'{args.output_path}/pos_rank/{args.loss_type}_{sample_method}_{args.id}.npy')
+    for f in [submission_json_file, log_json_file,pos_rank_file,grad_npy_file]:
         if not f.parent.exists():
             os.makedirs(f.parent, exist_ok=True)
     global_best_suffix = ""
@@ -273,6 +273,7 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
                 target_slice,
                 suffix_manager._loss_slice,tokenizer
             )
+            grad_matrix_log.append(coordinate_grad.detach().cpu().numpy())
             with torch.no_grad():
                 top_k = args.top_k
                 adv_suffix_tokens = input_ids[control_slice].to(device)
@@ -282,9 +283,15 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
                     batch_size=batch_size, topk=top_k,
                     not_allowed_tokens=not_allowed_tokens
                 )
-                pos_count = dict(Counter(sel_pos_list))
-                rank_count = dict(Counter(sel_rank_list))
+                #pos_count = dict(Counter(sel_pos_list))
+                #rank_count = dict(Counter(sel_rank_list))
+
+                # 新增：单独记录本批次全部 (位置, rank)
+                pos_rank_batch = list(zip(sel_pos_list, sel_rank_list))
+                pos_rank_log.append(pos_rank_batch)  # 只存纯数组，最小体积
+
                 unique_count = len(torch.unique(new_adv_suffix_toks, dim=0))
+                pos_rank_pairs = list(zip(sel_pos_list, sel_rank_list))
                 #print(f"        生成了 {batch_size} 条，不重复数量：{unique_count}")
                 new_adv_suffix = get_filtered_cands(
                     tokenizer,
@@ -314,7 +321,9 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
             # 用户每次替换
             adv_suffix = best_new_adv_suffix
 
-
+            # 新增：记录当前最优被选中的位置 & topk 内排名
+            best_sel_pos = sel_pos_list[best_ce_id]
+            best_sel_rank = sel_rank_list[best_ce_id]
             all_batch_ce_losses = losses.detach().cpu().mean().item()  # ✅ 整批平均 loss
             train_is_success = not any([prefix in pred_str for prefix in test_prefixes])
             # ===================== 【关键修复】保存全局最优 =====================
@@ -338,8 +347,10 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
                 "global_best_suffix": global_best_suffix,
                 "target": suffix_manager.target,
                 "simple_unique_count":unique_count,
-                "pos_count": pos_count,
-                "rank_count": rank_count,
+                #"pos_count": pos_count,
+                "best_sel_pos": best_sel_pos,
+                #"rank_count": rank_count,
+                "best_sel_rank": best_sel_rank,
             }
             log_dict.append(log_entry)
             print(f"id {args.id} | Step {i:2d} | ce_loss: {ce_loss}|" f"train_is_success:{train_is_success}")
@@ -354,10 +365,13 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
         if i % 10 == 0:
             with open(log_json_file, 'w', encoding='utf-8') as f:
                 json.dump(log_dict, f, ensure_ascii=False, indent=2)
-    with open(log_json_file, 'w', encoding='utf-8') as f:
-        json.dump(log_dict, f, ensure_ascii=False, indent=2)
+            np.save(pos_rank_file, np.array(pos_rank_log, dtype=object))
+            #np.save(grad_npy_file, np.array(grad_matrix_log, dtype=object))
+            # 直接堆叠成 3D 张量：[steps, control_len, vocab_size]
+            grad_stack = np.stack(grad_matrix_log, axis=0)
+            np.save(grad_npy_file, grad_stack)
+    # ================================================================
     return log_dict
-
 
 # 固定所有随机种子（关键！）
 def set_seed(seed=42):
@@ -581,11 +595,10 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="")
     parser.add_argument('--model_path', type=str, default=r"D:\Model\Llama-2-7b-chat-hf")
     parser.add_argument('--device', type=int, default=0)
-    #parser.add_argument('--id', type=int, default=1)
     parser.add_argument('--behaviors_config', type=str, default="./data/behaviors_config.json")
     parser.add_argument('--output_path', type=str,
                         default=f'./output/{datetime.datetime.now().strftime("%Y%m%d-%H%M%S")}')
-    parser.add_argument('--batch_size', type=int, default=512)
+    parser.add_argument('--batch_size', type=int, default=12)
     parser.add_argument('--top_k', type=int, default=256)
     parser.add_argument('--num_steps', type=int, default=500)
     parser.add_argument('--loss_type', type=str, default="cross_entropy", choices=["cross_entropy", "cosine", "contrast"])
@@ -606,7 +619,7 @@ if __name__ == '__main__':
     # ========== 循环运行多个样本 ==========
     model_name = os.path.basename(args.model_path)
     # 🔥 拼接你要的输出路径（完全不写死）
-    output_path = os.path.join(f"{model_name}_result",f'base_new_{datetime.datetime.now().strftime("%Y%m%d-%H%M%S")}')
+    output_path = os.path.join(f"{model_name}_result",f'Radom_{datetime.datetime.now().strftime("%Y%m%d-%H%M%S")}')
     args.output_path =output_path
     for data_id in range(args.start_id, args.end_id + 1):
         try:
