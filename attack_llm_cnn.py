@@ -296,6 +296,8 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
     not_allowed_tokens = None if allow_non_ascii else get_nonascii_toks(tokenizer)
     adv_suffix = adv_string_init
     log_dict = []
+    grad_matrix_log = []
+    pos_rank_log = []  # 专门存 (pos, rank) 批次记录
     # best_cos_sim = -float('inf')
     success_count = 0
     early_stop_threshold = 5
@@ -312,13 +314,19 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
     vis_states = pathlib.Path(
         f'{args.output_path}/vis_states/{mu}_{con_loss}_{args.loss_type}_{ppl_suffix}_{sample_method}_{args.id}'
     )
+    grad_npy_file = pathlib.Path(f'{args.output_path}/grad/{args.loss_type}_{sample_method}_{args.id}_grad.npy')
+    # ===================== 单独保存 pos_rank 日志 =====================
+    pos_rank_file = pathlib.Path(f'{args.output_path}/pos_rank/{args.loss_type}_{sample_method}_{args.id}.npy')
+    for f in [submission_json_file, log_json_file,pos_rank_file,grad_npy_file]:
+        if not f.parent.exists():
+            os.makedirs(f.parent, exist_ok=True)
     # 直接创建，不用判断 parent，更干净
     vis_states.mkdir(parents=True, exist_ok=True)
     for f in [submission_json_file, log_json_file]:
         if not f.parent.exists():
             os.makedirs(f.parent, exist_ok=True)
+    global_best_loss = float('inf')
     for i in range(num_steps):
-        global_best_loss = inf
         attack_success = ""
         attack_gen_str = ""
         try:
@@ -332,7 +340,9 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
                 suffix_manager._loss_slice,tokenizer
             )
             # ======================== 正确 Warmup ========================
-            selected_pos, pos_prob = guide_head(coordinate_grad, attn_suffix_map, batch_size)
+            selected_pos, pos_prob, selected_token, token_prob = guide_head(coordinate_grad, attn_suffix_map, batch_size)
+            grad_matrix_log.append(coordinate_grad.detach().cpu().numpy())
+
             with torch.no_grad():
                 top_k = args.top_k
                 adv_suffix_tokens = input_ids[control_slice].to(device)
@@ -344,8 +354,10 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
                     batch_size=batch_size, topk= args.top_k,
                     not_allowed_tokens=not_allowed_tokens
                 )
-                pos_count = dict(Counter(sel_pos_list))
-                rank_count = dict(Counter(sel_rank_list))
+
+                # 新增：单独记录本批次全部 (位置, rank)
+                pos_rank_batch = list(zip(sel_pos_list, sel_rank_list))
+                pos_rank_log.append(pos_rank_batch)  # 只存纯数组，最小体积
                 unique_count = len(torch.unique(new_adv_suffix_toks, dim=0))
                 #print(f"生成了 {batch_size} 条，不重复数量：{unique_count}")
                 new_adv_suffix = get_filtered_cands(
@@ -411,27 +423,27 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
             log_entry = {
                 "step": i,
                 "optimize_target": args.loss_type,
+                "behaviour": suffix_manager.instruction,  # 新增：对齐随机版
+                "target": suffix_manager.target,
                 "ce_loss": ce_loss,
                 "adv_suffix": adv_suffix,
-                "all_batch_ce_losses_mean": all_batch_ce_losses,  # ✅ 整批平均 loss
+                "all_batch_ce_losses_mean": all_batch_ce_losses,
                 "top_k": top_k,
+                "batch_size": batch_size,  # 新增：对齐随机版
                 "train_gen_str": pred_str,
                 "train_is_success": train_is_success,
-                #"attack_success": attack_success,
-                #"attack_gen_str": attack_gen_str,
                 "global_best_loss": global_best_loss,
                 "global_best_suffix": global_best_suffix,
-                "target": suffix_manager.target,
                 "simple_unique_count": unique_count,
-                "pos_count": pos_count,
-                "rank_count": rank_count,
+                #"pos_count": pos_count,
+                #"rank_count": rank_count,
                 "best_sel_pos": best_sel_pos,
                 "best_sel_rank": best_sel_rank,
             }
             log_dict.append(log_entry)
             print(f"id {args.id} | Step {i:2d} | CNN Loss: {total_loss.item():.6f}| ce_loss: {ce_loss}")
-            print("pos选的位置：", sorted(selected_pos.cpu().tolist()))
-           # print("rank选择：", sorted(selected_rank.cpu().tolist()))
+            #print("pos选的位置：", sorted(selected_pos.cpu().tolist()))
+            # print("rank选择：", sorted(selected_rank.cpu().tolist()))
         except Exception as e:
             trace_info = traceback.format_exc()
             print(f"\n❌ Step {i} 错误详情：\n{trace_info}")
@@ -440,6 +452,7 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
         if i % 10 == 0:
             with open(log_json_file, 'w', encoding='utf-8') as f:
                 json.dump(log_dict, f, ensure_ascii=False, indent=2)
+
             save_dict = {
                 "step": i,
                 # ========== 外部3大核心矩阵 ==========
@@ -455,7 +468,10 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
                 "token_head_w": guide_head.token_head.weight.detach().cpu(),
             }
             # torch.save(save_dict, f"./vis_states/step_{i}.pth")
+            np.save(pos_rank_file, np.array(pos_rank_log, dtype=object))
             torch.save(save_dict, vis_states / f"step_{i}.pth")
+            grad_stack = np.stack(grad_matrix_log, axis=0)
+            np.save(grad_npy_file, grad_stack)
         del coordinate_grad, input_ids, logits, ids
         gc.collect()
         torch.cuda.empty_cache()
@@ -693,7 +709,7 @@ if __name__ == '__main__':
     parser.add_argument('--behaviors_config', type=str, default="./data/behaviors_config.json")
     parser.add_argument('--output_path', type=str,
                         default=f'./output/{datetime.datetime.now().strftime("%Y%m%d-%H%M%S")}')
-    parser.add_argument('--batch_size', type=int, default=512)
+    parser.add_argument('--batch_size', type=int, default=12)
     parser.add_argument('--top_k', type=int, default=256)
     parser.add_argument('--num_steps', type=int, default=500)
     parser.add_argument('--early_stop', type=bool, default=False)
@@ -718,7 +734,7 @@ if __name__ == '__main__':
     conv_template = load_conversation_template(template_name)
     model_name = os.path.basename(args.model_path)
     # 🔥 拼接你要的输出路径（完全不写死）
-    output_path = os.path.join(f"{model_name}_result", f'base_{datetime.datetime.now().strftime("%Y%m%d-%H%M%S")}')
+    output_path = os.path.join(f"{model_name}_result", f'CNN_{datetime.datetime.now().strftime("%Y%m%d-%H%M%S")}')
     args.output_path = output_path
     for data_id in range(args.start_id, args.end_id + 1):
         args.id = data_id
@@ -746,6 +762,8 @@ if __name__ == '__main__':
             arg_items = [
                 ("Model Path", args.model_path),
                 ("Device", f"cuda:{args.device}"),
+                ("ID_start", args.start_id),
+                ("ID_end",   args.end_id),
                 ("ID", args.id),
                 ("Behaviors Config", args.behaviors_config),
                 ("Output Path", args.output_path),
