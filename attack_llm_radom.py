@@ -46,12 +46,6 @@ def get_git_version(file_path=__file__):
 GIT_COMMIT = get_git_version()
 # ============================================================
 
-# ===================== 全局配置（放在函数外面）=====================
-# 根目录
-GRAD_SAVE_ROOT = "./grad_logs"
-# 每次运行创建独立子文件夹（程序启动时创建一次）
-CURRENT_RUN_DIR = os.path.join(GRAD_SAVE_ROOT, time.strftime("%Y%m%d_%H%M%S"))
-os.makedirs(CURRENT_RUN_DIR, exist_ok=True)
 # ==================================================================
 def token_gradients(model, input_ids, input_slice, target_slice, loss_slice, tokenizer):
     #  1. 获取模型的词嵌入矩阵（shape: [词表大小, 嵌入维度]）
@@ -289,9 +283,8 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
                 # 新增：单独记录本批次全部 (位置, rank)
                 pos_rank_batch = list(zip(sel_pos_list, sel_rank_list))
                 pos_rank_log.append(pos_rank_batch)  # 只存纯数组，最小体积
-
                 unique_count = len(torch.unique(new_adv_suffix_toks, dim=0))
-                pos_rank_pairs = list(zip(sel_pos_list, sel_rank_list))
+                # pos_rank_pairs = list(zip(sel_pos_list, sel_rank_list))
                 #print(f"        生成了 {batch_size} 条，不重复数量：{unique_count}")
                 new_adv_suffix = get_filtered_cands(
                     tokenizer,
@@ -339,13 +332,15 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
                 "adv_suffix": adv_suffix,
                 "all_batch_ce_losses_mean": all_batch_ce_losses,  # ✅ 整批平均 loss
                 "top_k":top_k,
+                "batch_size":batch_size,
+                "behaviour": suffix_manager.instruction,
+                "target": suffix_manager.target,
                 "train_gen_str": pred_str,
                 "train_is_success":train_is_success,
-                "attack_success": attack_success,
-                "attack_gen_str": attack_gen_str,
+               # "attack_success": attack_success,
+               # "attack_gen_str": attack_gen_str,
                 "global_best_loss":global_best_loss,
                 "global_best_suffix": global_best_suffix,
-                "target": suffix_manager.target,
                 "simple_unique_count":unique_count,
                 #"pos_count": pos_count,
                 "best_sel_pos": best_sel_pos,
@@ -366,7 +361,7 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
             with open(log_json_file, 'w', encoding='utf-8') as f:
                 json.dump(log_dict, f, ensure_ascii=False, indent=2)
             np.save(pos_rank_file, np.array(pos_rank_log, dtype=object))
-            #np.save(grad_npy_file, np.array(grad_matrix_log, dtype=object))
+            # np.save(grad_npy_file, np.array(grad_matrix_log, dtype=object))
             # 直接堆叠成 3D 张量：[steps, control_len, vocab_size]
             grad_stack = np.stack(grad_matrix_log, axis=0)
             np.save(grad_npy_file, grad_stack)
@@ -621,6 +616,24 @@ if __name__ == '__main__':
     # 🔥 拼接你要的输出路径（完全不写死）
     output_path = os.path.join(f"{model_name}_result",f'Radom_{datetime.datetime.now().strftime("%Y%m%d-%H%M%S")}')
     args.output_path =output_path
+    print("               🚀 Experiment Arguments")
+    print("=" * 50)
+    arg_items = [
+        ("Device", f"cuda:{args.device}"),
+        ("Start_ID", args.start_id),
+        ("End_ID", args.end_id),
+        ("Behaviors Config", args.behaviors_config),
+        ("Output Path", args.output_path),
+        ("Batch Size", args.batch_size),
+        ("Top K", args.top_k),
+        ("Num Steps", args.num_steps),
+        ("Loss Type", args.loss_type),
+        ("Git Commit", GIT_COMMIT),  # <-- 在这里加上了
+    ]
+    for k, v in arg_items:
+        print(f"{k:<22} : {v}")
+    print("=" * 50)
+
     for data_id in range(args.start_id, args.end_id + 1):
         try:
             args.id = data_id
@@ -636,7 +649,7 @@ if __name__ == '__main__':
                 adv_string=adv_string_init
             )
             suffix_manager.get_prompt(adv_string=adv_string_init)
-            print("               🚀 Experiment Arguments")
+
             print("=" * 50)
             arg_items = [
                 ("Device", f"cuda:{args.device}"),
@@ -648,7 +661,6 @@ if __name__ == '__main__':
                 ("Num Steps", args.num_steps),
                 ("Loss Type", args.loss_type),
                 ("Init Suffix", adv_string_init),
-                ("Git Commit", GIT_COMMIT),  # <-- 在这里加上了
             ]
             for k, v in arg_items:
                 print(f"{k:<22} : {v}")
