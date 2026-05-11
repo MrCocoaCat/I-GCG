@@ -17,13 +17,14 @@ import numpy as np
 import random
 
 
-# 修复路径配置逻辑
-repo_root = os.getenv("LLM_ATTACKS_ROOT")
-if not repo_root:
-    current_script_path = os.path.abspath(__file__)
-    experiments_dir = os.path.dirname(current_script_path)
-    repo_root = os.path.dirname(experiments_dir)
+# ===================== 路径修复（必须第一！）=====================
+import sys
+import os
+current_script_path = os.path.abspath(__file__)
+experiments_dir = os.path.dirname(current_script_path)
+repo_root = os.path.dirname(experiments_dir)
 sys.path.append(os.path.abspath(repo_root))
+# ==========================================
 
 from llm_attacks.minimal_gcg.opt_utils import (
     token_gradients, sample_control, get_logits, generate,
@@ -32,13 +33,6 @@ from llm_attacks.minimal_gcg.opt_utils import (
 from llm_attacks.minimal_gcg.string_utils import SuffixManager, load_conversation_template
 from llm_attacks import get_nonascii_toks
 
-# ===================== 全局配置（放在函数外面）=====================
-# 根目录
-GRAD_SAVE_ROOT = "./grad_logs"
-# 每次运行创建独立子文件夹（程序启动时创建一次）
-CURRENT_RUN_DIR = os.path.join(GRAD_SAVE_ROOT, time.strftime("%Y%m%d_%H%M%S"))
-os.makedirs(CURRENT_RUN_DIR, exist_ok=True)
-# ==================================================================
 
 
 class SuffixManagerMulTarget:
@@ -162,7 +156,6 @@ class SuffixManagerMulTarget:
             sim_input_ids_list.append((input_ids,slices))
         # random.shuffle(sim_input_ids_list)
         return sim_input_ids_list
-
 
 
     def control_slice(self, toks=None):
@@ -490,15 +483,15 @@ def compute_both_scores(model, tokenizer, logits, ids, target_slice, args,test_p
     neg_slice = slice(neg_start, neg_end)
 
     # ===================== 预编码负样本（提速） =====================
-    neg_id_list = []
-    for s in test_prefixes:
-        nt = tokenizer.encode(s, add_special_tokens=False)
-        if len(nt) > max_neg_len:
-            nt = nt[:max_neg_len]
-        # while len(nt) < max_neg_len:
-        #     nt.append(nt[-1])
-        nt = nt[:max_neg_len]
-        neg_id_list.append(torch.tensor(nt, device=device))
+    # neg_id_list = []
+    # for s in test_prefixes:
+    #     nt = tokenizer.encode(s, add_special_tokens=False)
+    #     if len(nt) > max_neg_len:
+    #         nt = nt[:max_neg_len]
+    #     # while len(nt) < max_neg_len:
+    #     #     nt.append(nt[-1])
+    #     nt = nt[:max_neg_len]
+    #     neg_id_list.append(torch.tensor(nt, device=device))
 
     # ===================== 遍历每个候选 =====================
     for i in range(ids.shape[0]):
@@ -530,19 +523,19 @@ def compute_both_scores(model, tokenizer, logits, ids, target_slice, args,test_p
 
     return best_ce_id.item(), ce_loss, best_cos_id.item(), best_cos_sim ,best_contrast_id, contrast_loss
 
-# ===================== 修复：PPL 筛选函数（必须返回 ids） =====================
-def get_logits_ppl(model, tokenizer, input_ids, control_slice, test_controls, batch_size):
-    logits, ids = get_logits(
-        model=model, tokenizer=tokenizer, input_ids=input_ids,
-        control_slice=control_slice, test_controls=test_controls,
-        return_ids=True, batch_size=batch_size * 2
-    )
-    ppls = []
-    for i in range(ids.shape[0]):
-        ppl = check_input_ids_ppl(model, tokenizer, ids[i:i+1])
-        ppls.append(ppl)
-    ppls = torch.tensor(ppls, device=model.device)
-    return logits, ids, ppls  # ✅ 现在返回 3 个值
+# # ===================== 修复：PPL 筛选函数（必须返回 ids） =====================
+# def get_logits_ppl(model, tokenizer, input_ids, control_slice, test_controls, batch_size):
+#     logits, ids = get_logits(
+#         model=model, tokenizer=tokenizer, input_ids=input_ids,
+#         control_slice=control_slice, test_controls=test_controls,
+#         return_ids=True, batch_size=batch_size * 2
+#     )
+#     ppls = []
+#     for i in range(ids.shape[0]):
+#         ppl = check_input_ids_ppl(model, tokenizer, ids[i:i+1])
+#         ppls.append(ppl)
+#     ppls = torch.tensor(ppls, device=model.device)
+#     return logits, ids, ppls  # ✅ 现在返回 3 个值
 
 
 # ===================== 🔥 核心独立函数：为当前候选选择最优目标 =====================

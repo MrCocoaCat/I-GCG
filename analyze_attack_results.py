@@ -7,7 +7,7 @@ from collections import defaultdict
 import torch.nn as nn
 
 # ===================== 固定配置 =====================
-STAT_STEPS = [50, 100, 150, 200, 250, 300, 350, 400, 450, 500]
+STAT_STEPS = list(range(0, 500, 10))
 template_name = 'llama-2'
 device = "cuda:0"
 
@@ -101,7 +101,8 @@ def parse_log(log_path):
             "train_ce": entry["ce_loss"],  # 训练日志CE
             "train_asr_bool": entry["train_is_success"],  # 训练日志ASR
             "global_best_suffix": entry["global_best_suffix"],
-            "target": entry["target"]
+            "target": entry["target"],
+            "behaviour": entry["behaviour"]  # 新增：读取真实提示词
         }
     return step_map
 
@@ -145,7 +146,9 @@ def analyze_dir(log_dir, model, tokenizer):
 
             # 初始化
             conv = load_conversation_template(template_name)
-            sm = SuffixManager(tokenizer, conv, "", target, suffix)
+            behaviour = item["behaviour"]
+            sm = SuffixManager(tokenizer, conv, behaviour, target, suffix)
+           # sm = SuffixManager(tokenizer, conv, "", target, suffix)
 
             # 真实评估（分开调用）
             real_ce = compute_real_ce_loss(model, tokenizer, sm)
@@ -225,8 +228,7 @@ def print_compare(all_res):
 if __name__ == "__main__":
     MODEL_PATH = r"D:\Model\Llama-2-7b-chat-hf"
     INPUT_DIRS = [
-        r"D:\GitHub\I-GCG\Llama-2-7b-chat-hf_result\base_20260505-163531_CNN\log",
-        r"D:\GitHub\I-GCG\Llama-2-7b-chat-hf_result\base_20260505-163531_CNN\log",
+        r"D:\GitHub\I-GCG\vicuna-7b-v1.3_result\Radom_20260509-160651\log",
     ]
 
     print("🚀 启动GCG结果评估工具")
@@ -238,6 +240,7 @@ if __name__ == "__main__":
 
     all_results = {}
     for d in INPUT_DIRS:
+        print(d)
         if os.path.isdir(d):
             out = analyze_dir(d, model, tokenizer)
             if out:
@@ -245,3 +248,4 @@ if __name__ == "__main__":
                 all_results[n] = r
 
     print_compare(all_results)
+    print(INPUT_DIRS)

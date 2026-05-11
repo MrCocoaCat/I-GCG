@@ -365,6 +365,13 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
             # 直接堆叠成 3D 张量：[steps, control_len, vocab_size]
             grad_stack = np.stack(grad_matrix_log, axis=0)
             np.save(grad_npy_file, grad_stack)
+    with open(log_json_file, 'w', encoding='utf-8') as f:
+        json.dump(log_dict, f, ensure_ascii=False, indent=2)
+    np.save(pos_rank_file, np.array(pos_rank_log, dtype=object))
+    # np.save(grad_npy_file, np.array(grad_matrix_log, dtype=object))
+    # 直接堆叠成 3D 张量：[steps, control_len, vocab_size]
+    grad_stack = np.stack(grad_matrix_log, axis=0)
+    np.save(grad_npy_file, grad_stack)
     # ================================================================
     return log_dict
 
