@@ -3,6 +3,10 @@ import matplotlib.pyplot as plt
 import json
 from pathlib import Path
 import os
+from scipy.stats import pearsonr
+# 修复：正确导入并忽略警告
+import warnings
+warnings.filterwarnings("ignore")
 
 # ===================== 【0】基础配置（修改这里即可！）=====================
 # 你的实验输出根目录（和之前分析梯度一致）
@@ -125,15 +129,22 @@ print(f"Top10     {top10_random:<12.2f}{top10_best:<12.2f}{top10_best-top10_rand
 print(f"\n👉 终极结论：随机采样时排名均匀分布，筛选后高度集中在头部Token！")
 
 # ===================== 【5】可视化对比图表 =====================
-plt.rcParams["font.sans-serif"] = ["SimHei"]  # 中文显示
+plt.rcParams["font.sans-serif"] = ["SimHei"]
 plt.rcParams["axes.unicode_minus"] = False
+plt.rcParams['figure.dpi'] = 150
 
 # 图1：位置分布对比柱状图
 plt.figure(figsize=(12, 5))
 x = np.arange(CONTROL_POS_NUM)
 width = 0.35
-plt.bar(x - width/2, random_pos_ratio, width, label='全量随机候选', color='#1f77b4')
-plt.bar(x + width/2, best_pos_ratio, width, label='筛选最优选择', color='#ff7f0e')
+bar1 = plt.bar(x - width/2, random_pos_ratio, width, label='全量随机候选', color='#1f77b4', alpha=0.8)
+bar2 = plt.bar(x + width/2, best_pos_ratio, width, label='筛选最优选择', color='#ff7f0e', alpha=0.8)
+
+for i, v in enumerate(random_pos_ratio):
+    plt.text(i - width/2, v + 0.05, f'{v:.1f}', ha='center', fontsize=8)
+for i, v in enumerate(best_pos_ratio):
+    plt.text(i + width/2, v + 0.05, f'{v:.1f}', ha='center', fontsize=8)
+
 plt.xlabel('后缀位置编号', fontsize=12)
 plt.ylabel('被选中占比 (%)', fontsize=12)
 plt.title(f'ID{ANALYSIS_ID} 位置选择分布对比（随机 VS 筛选最优）', fontsize=14)
@@ -143,11 +154,17 @@ plt.grid(alpha=0.3)
 plt.tight_layout()
 plt.savefig(save_fig_path / f'id{ANALYSIS_ID}_position_compare.png', dpi=300)
 
-# 图2：排名分布对比折线图（Top50）
+# 图2：排名分布对比折线图
 plt.figure(figsize=(12, 5))
-plt.plot(range(50), random_rank_ratio[:50], label='全量随机候选', color='#1f77b4', linewidth=2)
-plt.plot(range(50), best_rank_ratio[:50], label='筛选最优选择', color='#ff7f0e', linewidth=2)
-plt.xlabel('Token排名 (Top50)', fontsize=12)
+show_top = 30
+plt.plot(range(show_top), random_rank_ratio[:show_top], label='全量随机候选',
+         color='#1f77b4', linewidth=2.5, marker='o', markersize=4)
+plt.plot(range(show_top), best_rank_ratio[:show_top], label='筛选最优选择',
+         color='#ff7f0e', linewidth=2.5, marker='s', markersize=4)
+plt.fill_between(range(show_top), random_rank_ratio[:show_top], alpha=0.2, color='#1f77b4')
+plt.fill_between(range(show_top), best_rank_ratio[:show_top], alpha=0.2, color='#ff7f0e')
+
+plt.xlabel('Token排名 (Top30)', fontsize=12)
 plt.ylabel('被选中占比 (%)', fontsize=12)
 plt.title(f'ID{ANALYSIS_ID} Token排名分布对比（随机 VS 筛选最优）', fontsize=14)
 plt.legend()
@@ -155,15 +172,94 @@ plt.grid(alpha=0.3)
 plt.tight_layout()
 plt.savefig(save_fig_path / f'id{ANALYSIS_ID}_rank_compare.png', dpi=300)
 
-# ===================== 【6】最终总结报告 =====================
+# ===================== 【新增A】梯度强度 ↔ 位置选择相关性 =====================
 print("\n" + "="*80)
-print("📢 最终核心结论（验证你的猜想！）")
+print("📌 新增分析A：梯度强度 与 位置选择偏好 相关性")
 print("="*80)
-print(f"1. 原始随机采样：位置/排名 均为均匀分布（方差小、无偏好）")
-print(f"2. Loss筛选后：分布彻底改变 → 位置有明显偏好、Token高度集中头部")
-print(f"3. 你的判断完全正确：均匀只是采样阶段的表象，筛选后才是真实优化规律！")
-print(f"4. 这就是GCG的核心逻辑：随机提供候选池，Loss筛选出最优组合！")
+
+grad_data = np.load(grad_path)
+position_gradient = np.mean(np.abs(grad_data), axis=(0, 2))
+corr, p_val = pearsonr(position_gradient, best_pos_ratio)
+
+print(f"🔍 相关系数 r = {corr:.4f} | 显著性 p = {p_val:.4f}")
+print(f"📌 相关性判断：|r|>0.7强相关 | 0.3~0.7中等相关 | <0.3弱相关")
+print(f"\n📋 每个位置：梯度强度 | 筛选后选中占比(%)")
+for i in range(CONTROL_POS_NUM):
+    print(f"位置{i:<2} | 梯度:{position_gradient[i]:<6.2f} | 占比:{best_pos_ratio[i]:<5.2f}")
+
+# 绘图：梯度-位置相关性散点图
+plt.figure(figsize=(8, 5))
+plt.scatter(position_gradient, best_pos_ratio, s=80, color='#ff7f0e', alpha=0.8, label="位置数据点")
+
+# 安全拟合，无警告
+try:
+    z = np.polyfit(position_gradient, best_pos_ratio, 1)
+    p = np.poly1d(z)
+    plt.plot(position_gradient, p(position_gradient), "r--", linewidth=2, label=f"拟合直线 (r={corr:.3f})")
+except:
+    pass
+
+plt.xlabel("位置梯度强度", fontsize=12)
+plt.ylabel("筛选后位置选中占比 (%)", fontsize=12)
+plt.title(f"梯度-位置相关性分析 (ID={ANALYSIS_ID})", fontsize=14)
+plt.legend()
+plt.grid(alpha=0.3)
+plt.tight_layout()
+plt.savefig(save_fig_path / f'id{ANALYSIS_ID}_gradient_position_corr.png', dpi=300)
+
+# ===================== 【新增B】梯度 ↔ 相邻位置关联性分析 =====================
+print("\n" + "="*80)
+print("📌 新增分析B：梯度 相邻位置 邻域相关性")
 print("="*80)
-print(f"🎉 分析完成！所有图片已保存至: {save_fig_path}")
+
+# 计算每个位置的梯度序列
+pos_grad_sequence = np.mean(np.abs(grad_data), axis=2)  # [steps, 20]
+# 计算20x20相关矩阵
+corr_matrix = np.corrcoef(pos_grad_sequence.T)
+
+# 计算相邻位置相关性
+neighbor_corr = []
+for i in range(CONTROL_POS_NUM - 1):
+    neighbor_corr.append(corr_matrix[i, i+1])
+mean_neighbor = np.mean(neighbor_corr)
+
+# 隔一个位置相关性
+skip_corr = []
+for i in range(CONTROL_POS_NUM - 2):
+    skip_corr.append(corr_matrix[i, i+2])
+mean_skip = np.mean(skip_corr)
+
+print(f"🔍 相邻位置(i ↔ i+1) 平均相关系数: {mean_neighbor:.4f}")
+print(f"🔍 隔一位位置(i ↔ i+2) 平均相关系数: {mean_skip:.4f}")
+print("\n📌 相邻梯度关联性结论：")
+if mean_neighbor > 0.7:
+    print("   ✅ 强相关：相邻位置梯度高度联动、局部连续")
+elif mean_neighbor > 0.3:
+    print("   ⚠️  中等相关：有一定邻域关联")
+else:
+    print("   ❌ 弱相关：相邻位置梯度相互独立、无关联")
+
+print(f"\n📋 逐对相邻位置相关系数：")
+for i in range(CONTROL_POS_NUM - 1):
+    print(f"位置{i} ↔ 位置{i+1} : {corr_matrix[i,i+1]:.4f}")
+
+# 绘图：位置梯度相关性热力图
+plt.figure(figsize=(8, 7))
+im = plt.imshow(corr_matrix, cmap='RdBu_r', vmin=-1, vmax=1)
+plt.colorbar(im, label='Pearson Correlation')
+plt.xticks(range(CONTROL_POS_NUM), range(CONTROL_POS_NUM))
+plt.yticks(range(CONTROL_POS_NUM), range(CONTROL_POS_NUM))
+plt.xlabel('位置编号', fontsize=12)
+plt.ylabel('位置编号', fontsize=12)
+plt.title('后缀位置梯度 两两相关性热力图', fontsize=14)
+plt.tight_layout()
+plt.savefig(save_fig_path / f'id{ANALYSIS_ID}_grad_neighbor_corr.png', dpi=300)
+
+# ===================== 最终总结 =====================
+print("\n" + "="*80)
+print("📢 全部分析完成！")
+print("生成文件：4张高清分析图 + 全维度数据打印")
+print("存储路径：", save_fig_path)
+print("="*80)
 
 plt.show()

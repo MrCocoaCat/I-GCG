@@ -15,7 +15,7 @@ import traceback
 import linecache
 import numpy as np
 import random
-
+from cmath import inf
 
 # ===================== 路径修复（必须第一！）=====================
 import sys
@@ -165,90 +165,6 @@ class SuffixManagerMulTarget:
     def loss_slice(self, toks=None):
         return self._loss_slice if toks is None else toks[self._loss_slice]
 
-# ===================== 自适应TopK加权采样 =====================
-def sample_control_weighted(control_toks, grad, batch_size, topk=128, temp=1.0, not_allowed_tokens=None):
-    # 自适应TopK（根据batch自动调整，避免重复）
-    # adaptive_topk = max(topk, batch_size * 2, 32)
-    adaptive_topk = topk
-    #if not_allowed_tokens is not None:
-    #    grad[:, not_allowed_tokens.to(grad.device)] = float('inf')
-        # 🔥 8位日期 + 毫秒（完美可读性 + 永不重复）
-        # 保存最原始梯度（自动进入本次运行的文件夹）
-    timestamp = time.strftime("%Y%m%d_%H%M%S") + f"_{int(time.time() * 1000) % 1000}"
-    save_path = os.path.join(CURRENT_RUN_DIR, f"grad_original_weighted_{timestamp}.pt")
-    torch.save(grad.cpu(), save_path)
-
-    topk_result = (-grad).topk(adaptive_topk * 2 , dim=1)
-    top_indices = topk_result.indices
-    topk_values = topk_result.values
-
-
-    control_toks = control_toks.to(grad.device)
-    original_control_toks = control_toks.repeat(batch_size, 1)
-    new_token_pos = torch.arange(
-        0, len(control_toks), len(control_toks) / batch_size,
-        device=grad.device
-    ).type(torch.int64)
-
-    # ===================== Mask-GCG 加权位置采样 =====================
-    num_control = len(control_toks)
-
-    grad_norm = grad.abs().sum(dim=-1)  # L1 norm
-
-
-    position_prob = torch.softmax(grad_norm / 0.1, dim=0)
-
-    new_token_pos = []
-    used_pos = set()
-    while len(new_token_pos) < batch_size:
-        pos = torch.multinomial(position_prob, 1).item()
-        if pos not in used_pos:
-            used_pos.add(pos)
-            new_token_pos.append(pos)
-    new_token_pos = torch.tensor(new_token_pos, device=grad.device)
-    selected_topk_values = torch.index_select(topk_values, dim=0, index=new_token_pos)
-    # probs = torch.softmax(selected_topk_values / temp, dim=-1)
-
-    logits = selected_topk_values / temp
-    logits = logits - logits.max(dim=-1, keepdim=True).values
-    probs = torch.softmax(logits, dim=-1)
-
-    # idx = torch.multinomial(probs, num_samples=1, replacement=True)
-    # ===================== ✅ 逐一生成 + 检查重复 + 重复后移 =====================
-    generated = set()  # 记录已经生成的句子
-    idx_list = []
-    for i in range(batch_size):
-        # 当前要替换的位置
-        pos = new_token_pos[i]
-        # 当前概率
-        p = probs[i]
-        # 采样一个 index
-        idx = torch.multinomial(p, 1).item()
-        # 🔥 关键：如果重复，就一直往后移一位，直到不重复
-        while True:
-            # 取出 token
-            token = top_indices[pos, idx]
-            # 复制原始句子，替换当前位置
-            seq = original_control_toks[i].clone()
-            seq[pos] = token
-            # 转成可哈希的 key
-            key = tuple(seq.cpu().numpy())
-            if key not in generated:
-                generated.add(key)
-                idx_list.append(idx)
-                break
-            # 重复了 → 后移一个 token
-            idx = (idx + 1) % adaptive_topk
-
-    # 🔥【唯一修复】这里把 shape 变成 [batch, 1]
-    idx = torch.tensor(idx_list, device=grad.device).unsqueeze(1)
-    # ==========================================================================
-    selected_topk = torch.index_select(top_indices, dim=0, index=new_token_pos)
-    new_token_val = torch.gather(input=selected_topk, dim=1, index=idx)
-    new_token_pos_u = new_token_pos.unsqueeze(-1)
-    new_control_toks = original_control_toks.scatter_(dim=1, index=new_token_pos_u, src=new_token_val)
-    return new_control_toks, idx, adaptive_topk
-
 
 # 核心：适配所有主流LLM的嵌入层获取逻辑
 def get_model_embedding_layer(model):
@@ -328,7 +244,7 @@ def token_gradients_mul(model, input_ids, control_slice, target_slice, loss_slic
     # if update_counter >= args.stick_steps or update_counter == 0:
     min_loss = float('inf')
     best_idx = -1
-
+    pred_str_list = []
     for idx, sim_item in enumerate(sim_input_list):
         sim_ids, sim_slices = sim_item
         target_slice = sim_slices["target_slice"]
@@ -344,8 +260,9 @@ def token_gradients_mul(model, input_ids, control_slice, target_slice, loss_slic
         pred_str = tokenizer.decode(pred_tokens, skip_special_tokens=True)
 
         print(f"sim_input_list id: [{idx}] " f"logit_len={logit_len:2d} | "f"target_len={target_len:2d} | "f"loss_slice={loss_slice} | "f"target_slice={target_slice}")
-        print(f"sim_input_list id: [{idx}] 🎯 TARGET: {repr(target_str)}")
-        print(f"sim_input_list id: [{idx}] 🤖 PREDIC: {repr(pred_str)}")
+       # print(f"sim_input_list id: [{idx}] 🎯 TARGET: {repr(target_str)}")
+       # print(f"sim_input_list id: [{idx}] 🤖 PREDIC: {repr(pred_str)}")
+        pred_str_list.append(pred_str)
 
         # 安全对齐长度
         if logit.shape[0] != targets.shape[0]:
@@ -370,7 +287,8 @@ def token_gradients_mul(model, input_ids, control_slice, target_slice, loss_slic
     del one_hot, input_embeds, embeds_batch, full_embeds, outputs, logits, min_loss
     torch.cuda.empty_cache()
     gc.collect()
-    return grad_l2, best_target_str, current_target_index
+
+    return grad_l2, best_target_str, current_target_index, pred_str_list
 
 # 全局配置
 allow_non_ascii = False
@@ -652,9 +570,8 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
         if not f.parent.exists():
             os.makedirs(f.parent, exist_ok=True)
 
-
-
-    for i in range(1, num_steps + 1):
+    global_best_loss = inf
+    for i in range( num_steps):
         try:
             best_target_str = ""
             # 自动选择：多目标 / 单目标
@@ -668,7 +585,7 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
                 loss_slice = current_sim_input_slices["loss_slice"]
                 pred_str = tokenizer.decode(input_ids, skip_special_tokens=True)
                 #print(pred_str)
-                coordinate_grad, best_target_str, current_target_index = token_gradients_mul(
+                coordinate_grad, best_target_str, current_target_index, pred_str_list = token_gradients_mul(
                     model,input_ids,control_slice,target_slice,loss_slice,
                     suffix_manager, tokenizer, device,
                     adv_suffix=adv_suffix,
@@ -696,18 +613,12 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
                 top_k = args.top_k
                 adv_suffix_tokens = input_ids[control_slice].to(device)
                 # 加权采样开关
-                if args.use_weighted_sample:
-                    new_adv_suffix_toks, _, _ = sample_control_weighted(
-                        adv_suffix_tokens, coordinate_grad,
-                        batch_size=batch_size, topk=top_k,
-                        not_allowed_tokens=not_allowed_tokens
-                    )
-                else:
-                    new_adv_suffix_toks = sample_control(
-                        adv_suffix_tokens, coordinate_grad,
-                        batch_size=batch_size, topk=top_k,
-                        not_allowed_tokens=not_allowed_tokens
-                    )
+
+                new_adv_suffix_toks = sample_control(
+                    adv_suffix_tokens, coordinate_grad,
+                    batch_size=batch_size, topk=top_k,
+                    not_allowed_tokens=not_allowed_tokens
+                )
                 unique_count = len(torch.unique(new_adv_suffix_toks, dim=0))
                 print(f"生成了 {batch_size} 条，不重复数量：{unique_count}")
 
@@ -740,6 +651,10 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
                     args=args,
                     test_prefixes=test_prefixes,
                     device=device)
+                train_is_success = any(
+                    not any(prefix in s for prefix in test_prefixes)
+                    for s in pred_str_list
+                )
                 # ===================== 选择后缀 =====================
                 if args.loss_type == "cross_entropy":
                     best_id = best_ce_id
@@ -758,31 +673,44 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
                     best_cos_sim = current_cos_sim
                 # 测试
                 input_ids_new = suffix_manager.get_input_ids(adv_string=adv_suffix).to(device)
-                is_success, gen_str = check_for_attack_success(
-                    model, tokenizer, input_ids_new,
-                    suffix_manager._assistant_role_slice, test_prefixes
-                )
-                ppl = check_input_ids_ppl(model, tokenizer, input_ids_new)
+                # is_success, gen_str = check_for_attack_success(
+                #     model, tokenizer, input_ids_new,
+                #     suffix_manager._assistant_role_slice, test_prefixes
+                # )
+                # ppl = check_input_ids_ppl(model, tokenizer, input_ids_new)
                 # 日志
+                # ===================== 【关键修复】保存全局最优 =====================
+                if current_ce_loss < global_best_loss:
+                    global_best_loss = current_ce_loss
+                    global_best_suffix = best_new_adv_suffix
                 log_entry = {
                     "step": i,
                     "optimize_target": args.loss_type,
-                    "use_ppl_filter": args.use_ppl_filter,  # <--- 已加
-                    "current_cross_entropy": current_ce_loss,
+                    "behaviour": suffix_manager.instruction,  # 新增：对齐随机版
+                    "target": suffix_manager.target,
+                    "ce_loss": current_ce_loss,
+                    "adv_suffix": adv_suffix,
+                    #"all_batch_ce_losses_mean": all_batch_ce_losses,
+                    "top_k": top_k,
+                    "batch_size": batch_size,  # 新增：对齐随机版
+                    "train_gen_str": pred_str_list,
+                    "train_is_success": train_is_success,
+                    "global_best_loss": global_best_loss,
+                    "global_best_suffix": global_best_suffix,
+                    "simple_unique_count": unique_count,
+                    # "pos_count": pos_count,
+                    # "rank_count": rank_count,
+                    # "best_sel_pos": best_sel_pos,
+                    # "best_sel_rank": best_sel_rank,
                     "current_cosine_sim": current_cos_sim,
                     "current_contrast_loss": contrast_loss,
                     "best_cross_entropy": best_ce_loss,
                     "best_cosine_sim": best_cos_sim,
-                    "top_k":top_k,
-                    "attack_success": is_success,
-                    "ppl": ppl,
+                    # "ppl": ppl,
                     "best_adv_suffix": adv_suffix,
                     "current_suffix": best_new_adv_suffix,
-                    "gen_str": gen_str,
-                    "target": suffix_manager.target,
                     "target_best": best_target_str,
                     "current_target_index": str(current_target_index),
-                    "simple_unique_count":unique_count
                 }
                 log_dict.append(log_entry)
 
@@ -790,10 +718,10 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
                 ppl_flag = "PPL=ON" if args.use_ppl_filter else "PPL=OFF"
                 con_flag = "Contrast=ON" if args.use_contrast_loss else "Contrast=OFF"
                 print(
-                    f"id {args.id} | Step {i:2d} | {ppl_flag} | {con_flag} | Opt:{args.loss_type:6s} | ppl {ppl:.4f} | "
+                    f"id {args.id} | Step {i:2d} | {ppl_flag} | {con_flag} | Opt:{args.loss_type:6s}  | "
                     f"CE:{current_ce_loss:.4f}({best_ce_loss:.4f}) | "
                     f"Cos:{current_cos_sim:.4f}({best_cos_sim:.4f}) | "
-                    f"Success:{is_success}"
+                   # f"Success:{is_success}"
                 )
         except Exception as e:
             trace_info = traceback.format_exc()
@@ -804,8 +732,8 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
 
         del coordinate_grad, adv_suffix_tokens, new_adv_suffix_toks
         del input_ids, input_ids_new, logits, ids
-        if 'ppl' in locals():
-            del ppl
+        # if 'ppl' in locals():
+        #     del ppl
         gc.collect()
         torch.cuda.empty_cache()
         if i % 10 == 0:
@@ -819,7 +747,7 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
         "best_adv_suffix": adv_suffix,
         "best_cross_entropy": best_ce_loss,
         "best_cosine_sim": best_cos_sim,
-        "gen_str": gen_str,
+        #"gen_str": gen_str,
         "target": suffix_manager.target,
         "total_steps": len(log_dict)
     }
@@ -863,9 +791,10 @@ if __name__ == '__main__':
     parser.add_argument('--behaviors_config', type=str, default="./data/adv_similar_qwen.json")
     parser.add_argument('--output_path', type=str,
                         default=f'./output/{datetime.datetime.now().strftime("%Y%m%d-%H%M%S")}')
-    parser.add_argument('--batch_size', type=int, default=1)
-    parser.add_argument('--top_k', type=int, default=128)
-    parser.add_argument('--num_steps', type=int, default=1)
+
+    parser.add_argument('--batch_size', type=int, default=512)
+    parser.add_argument('--top_k', type=int, default=256)
+    parser.add_argument('--num_steps', type=int, default=500)
     parser.add_argument('--early_stop', type=bool, default=True)
     parser.add_argument('--loss_type', type=str, default="cross_entropy", choices=["cross_entropy", "cosine", "contrast"])
     parser.add_argument('--use_ppl_filter', type=lambda x: x.lower() == 'true', default=False)
@@ -886,6 +815,30 @@ if __name__ == '__main__':
     device = f"cuda:{args.device}" if torch.cuda.is_available() else "cpu"
     os.environ["CUDA_VISIBLE_DEVICES"] = str(args.device)
     set_seed(42)
+    adv_string_init = args.str_init
+    arg_items = [
+        ("Model Path", args.model_path),
+        ("Device", f"cuda:{args.device}"),
+        ("STRT_ID", args.start_id),
+        ("END_ID", args.end_id),
+        ("Behaviors Config", args.behaviors_config),
+        ("Output Path", args.output_path),
+        ("Batch Size", args.batch_size),
+        ("Top K", args.top_k),
+        ("Num Steps", args.num_steps),
+        ("Early Stop", args.early_stop),
+        ("Loss Type", args.loss_type),
+        ("Use PPL Filter", args.use_ppl_filter),
+        ("Init Suffix", adv_string_init),
+        ("Stick Steps", args.stick_steps),
+        ("Use Multi Target", args.use_multi_target),
+        ("Use Contrast Loss", args.use_contrast_loss),
+        #  ("Neg Weight", args.neg_weight),
+        ("Target Similar Key", args.target_similar_key),
+    ]
+    for k, v in arg_items:
+        print(f"{k:<22} : {v}")
+    print("=" * 50)
     model, tokenizer = load_model_and_tokenizer(args.model_path,
                                                 low_cpu_mem_usage=True,
                                                 use_cache=False,
@@ -902,7 +855,7 @@ if __name__ == '__main__':
             behavior_config = yaml.load(open(args.behaviors_config, 'r', encoding='utf-8'), Loader=yaml.FullLoader)[args.id - 1]
             user_prompt = behavior_config["behaviour"]
             target = behavior_config["target"]
-            adv_string_init = args.str_init
+
             if args.use_multi_target:
                 target_sim_list = [item["text"] for item in behavior_config[args.target_similar_key]]
                 suffix_manager = SuffixManagerMulTarget(
@@ -937,28 +890,6 @@ if __name__ == '__main__':
             #print("=" * 50)
 
             # 在arg_items列表中添加一行，打印target_similar_key参数（补全完整上下文，可直接复制）
-            arg_items = [
-                ("Model Path", args.model_path),
-                ("Device", f"cuda:{args.device}"),
-                ("ID", args.id),
-                ("Behaviors Config", args.behaviors_config),
-                ("Output Path", args.output_path),
-                ("Batch Size", args.batch_size),
-                ("Top K", args.top_k),
-                ("Num Steps", args.num_steps),
-                ("Early Stop", args.early_stop),
-                ("Loss Type", args.loss_type),
-                ("Use PPL Filter", args.use_ppl_filter),
-                ("Init Suffix", adv_string_init),
-                ("Stick Steps", args.stick_steps),
-                ("Use Multi Target", args.use_multi_target),
-                ("Use Contrast Loss", args.use_contrast_loss),
-              #  ("Neg Weight", args.neg_weight),
-                ("Target Similar Key", args.target_similar_key),
-            ]
-            # for k, v in arg_items:
-            #     print(f"{k:<22} : {v}")
-            # print("=" * 50)
 
             start = time.time()
             log_dict = minimal_gcg_attack(

@@ -1,7 +1,5 @@
 import argparse
 import json
-from cmath import inf
-
 import yaml
 import datetime
 import os
@@ -17,6 +15,7 @@ import traceback
 import linecache
 import numpy as np
 import random
+from cmath import inf
 from collections import Counter
 
 # 修复路径配置逻辑
@@ -32,20 +31,13 @@ from llm_attacks.minimal_gcg.opt_utils import ( get_logits, generate,
 )
 from llm_attacks.minimal_gcg.string_utils import load_conversation_template
 from llm_attacks import get_nonascii_toks
-import subprocess
-# ===================== 获取 Git 版本号 =====================
-def get_git_version(file_path=__file__):
-    try:
-        file_dir = os.path.dirname(os.path.abspath(file_path))
-        cmd = ["git", "log", "-1", "--pretty=format:%H"]
-        commit = subprocess.check_output(cmd, cwd=file_dir, text=True, stderr=subprocess.PIPE).strip()
-        return commit
-    except:
-        return "unknown"
 
-GIT_COMMIT = get_git_version()
-# ============================================================
-
+# ===================== 全局配置（放在函数外面）=====================
+# 根目录
+GRAD_SAVE_ROOT = "./grad_logs"
+# 每次运行创建独立子文件夹（程序启动时创建一次）
+CURRENT_RUN_DIR = os.path.join(GRAD_SAVE_ROOT, time.strftime("%Y%m%d_%H%M%S"))
+os.makedirs(CURRENT_RUN_DIR, exist_ok=True)
 # ==================================================================
 def token_gradients(model, input_ids, input_slice, target_slice, loss_slice, tokenizer):
     #  1. 获取模型的词嵌入矩阵（shape: [词表大小, 嵌入维度]）
@@ -106,8 +98,8 @@ def token_gradients(model, input_ids, input_slice, target_slice, loss_slice, tok
     target_str = tokenizer.decode(targets, skip_special_tokens=True)
     pred_tokens = outputs_targets_logits.argmax(dim=-1)
     pred_str = tokenizer.decode(pred_tokens, skip_special_tokens=True)
-    print(f"        🎯 上次优化的结果，   TARGET: {repr(target_str)}")
-    print(f"        🤖 这是模型输出得结果，PREDIC: {repr(pred_str)}")
+    print(f"🎯 上次优化的结果，   TARGET: {repr(target_str)}")
+    print(f"🤖 这是模型输出得结果，PREDIC: {repr(pred_str)}")
 
     loss = nn.CrossEntropyLoss()(outputs_targets_logits, targets)
     # 7. 反向传播计算梯度（仅更新one_hot.grad）
@@ -119,43 +111,113 @@ def token_gradients(model, input_ids, input_slice, target_slice, loss_slice, tok
     one_hot_grad = one_hot.grad.clone()
     grad_l2 = one_hot_grad / one_hot_grad.norm(dim=-1, keepdim=True)
     # 返回归一化后的梯度：指导对抗Token的优化方向
-    attn_map = attn_map.detach().clone()
-    return grad_l2, attn_map,target_str, pred_str
+    attn_map_cl = attn_map.detach().clone()
 
-def check_for_attack_success(model, tokenizer, suffix_manager, suffix: str, test_prefixes: list, gen_config=None):
-    if gen_config is None:
-        gen_config = {
-            "max_new_tokens": 64,
-            "do_sample": False,
-            "temperature": 0.0,
-        }
-    # 1. 拿完整模板prompt（包含[INST]）
-   # full_template_prompt = suffix.get_prompt(adv_string=suffix)
-    full_template_prompt = suffix_manager.get_prompt(adv_string=suffix)
-    # 2. 切断 target 部分，只保留 问题+后缀+模板
-    pure_query = full_template_prompt.split(suffix_manager.target)[0].strip()
-    # 3. 标准tokenize
-    inputs = tokenizer(pure_query, return_tensors="pt").to(model.device)
-    with torch.no_grad():
-        output_ids = model.generate(
-            **inputs,
-            pad_token_id=tokenizer.eos_token_id,
-            **gen_config
+    # 截取：后缀 ↔ 后缀 的 attention
+    suffix_start = input_slice.start
+    suffix_end = input_slice.stop
+
+    attn_suffix_map = attn_map_cl[
+        suffix_start:suffix_end,
+        suffix_start:suffix_end
+    ]
+
+    return grad_l2, attn_suffix_map,target_str, pred_str
+
+
+import torch
+import torch.nn as nn
+
+import torch
+import torch.nn as nn
+
+class GradPolicyLSTM(nn.Module):
+    def __init__(self, suffix_len, vocab_size, topk, hidden_dim=128):
+        super().__init__()
+        self.suffix_len = suffix_len
+        self.vocab_size = vocab_size
+        self.hidden_dim = hidden_dim
+
+        # ========== 1. Token 嵌入（当前后缀长什么样）==========
+        self.token_emb = nn.Embedding(vocab_size, hidden_dim)
+
+        # ========== 2. 梯度投影 ==========
+        self.grad_proj = nn.Sequential(
+            nn.Linear(vocab_size, hidden_dim),
+            nn.GELU()
         )
-    input_len = inputs.input_ids.shape[1]
-    gen_str = tokenizer.decode(
-        output_ids[0, input_len:],  # <-- 最标准写法
-        skip_special_tokens=True
-    ).strip()
 
-    jail_broken = not any(p in gen_str for p in test_prefixes)
-    return jail_broken, gen_str
+        # ========== 3. 注意力投影 ==========
+        self.attn_proj = nn.Sequential(
+            nn.Linear(suffix_len, hidden_dim),
+            nn.GELU()
+        )
 
-def sample_control(control_toks, grad, batch_size ,topk=256, temp=1.0, not_allowed_tokens=None):
+        # ========== 🔥 核心：LSTM 时序记忆 ==========
+        self.lstm = nn.LSTM(
+            input_size=hidden_dim * 3,
+            hidden_size=hidden_dim,
+            num_layers=2,
+            batch_first=True,
+            bidirectional=False
+        )
+
+        # ========== 输出头（和你原来完全一样）==========
+        self.pos_head = nn.Linear(hidden_dim, 1)       # 预测位置
+        self.token_head = nn.Linear(hidden_dim, vocab_size)  # 预测token
+
+        # LSTM 记忆状态（全局保留，实现时序）
+        self.hidden = None
+
+    def forward(self, grad, attn_suffix, batch_size, temp=1.0):
+        grad = grad.to(torch.float32)
+        attn_suffix = attn_suffix.to(torch.float32)
+
+        L = grad.shape[0]
+        device = grad.device
+        dtype = grad.dtype
+
+        dummy_tokens = torch.arange(L, device=device)
+        tok_feat = self.token_emb(dummy_tokens)
+
+        grad_feat = self.grad_proj(grad)
+        attn_feat = self.attn_proj(attn_suffix)
+
+        feat = torch.cat([tok_feat, grad_feat, attn_feat], dim=-1)
+        feat = feat.unsqueeze(0)
+
+        # ======================
+        # 🔥 我已经帮你加在这里了！
+        # ======================
+        if self.hidden is not None:
+            self.hidden = (self.hidden[0].detach(), self.hidden[1].detach())
+
+        lstm_out, self.hidden = self.lstm(feat, self.hidden)
+        lstm_out = lstm_out.squeeze(0)
+
+        pos_logit = self.pos_head(lstm_out).squeeze(-1)
+        pos_prob = torch.softmax(pos_logit / temp, dim=-1)
+        selected_pos = torch.multinomial(pos_prob, batch_size, replacement=True)
+
+        token_logits = self.token_head(lstm_out)
+        token_prob = torch.softmax(token_logits / temp, dim=-1)
+        selected_token_prob = token_prob[selected_pos]
+        selected_token = torch.multinomial(selected_token_prob, 1).squeeze(-1)
+
+        return selected_pos, pos_prob.unsqueeze(0), selected_token, token_prob
+
+    # 每换一个新句子，必须重置记忆！
+    def reset_hidden(self):
+        self.hidden = None
+
+def sample_control(control_toks, grad, batch_size, selected_pos, topk=256, temp=1.0, not_allowed_tokens=None):
+
     if not_allowed_tokens is not None:
         grad[:, not_allowed_tokens.to(grad.device)] = np.inf
+
     top_indices = (-grad).topk(topk, dim=1).indices
     control_toks = control_toks.to(grad.device)
+
     original_control_toks = control_toks.repeat(batch_size, 1)
     # new_token_pos = torch.arange(
     #     0,
@@ -164,14 +226,13 @@ def sample_control(control_toks, grad, batch_size ,topk=256, temp=1.0, not_allow
     #     device=grad.device
     # ).type(torch.int64)
     #print(new_token_pos, selected_pos)
-    new_token_pos = torch.randint(
-        low=0,
-        high=len(control_toks),
-        size=(batch_size,),
-        device=grad.device
-    )
+    new_token_pos = selected_pos
+
     rand_idx = torch.randint(0, topk, (batch_size, 1), device=grad.device)
     selected_rank = rand_idx.squeeze(1).cpu().tolist()  # ✅ 正确获取排名
+    #selected_rank = selected_rank.unsqueeze(-1)
+    #print(rand_idx, selected_rank)
+   # rand_idx = selected_rank
     new_token_val = torch.gather(
         top_indices[new_token_pos], 1,
         rand_idx
@@ -197,6 +258,7 @@ def get_model_embedding_layer(model):
         print("=== 模型结构预览（前10行）===")
         print(str(model)[:1000])
         raise ValueError("未识别的模型结构，请手动指定嵌入层路径！")
+
 
 # 全局配置
 allow_non_ascii = False
@@ -231,61 +293,87 @@ def check_input_ids_ppl(model, tokenizer, input_ids):
             prompt_ppl = torch.exp(loss).item()
     return prompt_ppl
 
+
+
 def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_steps, device, test_prefixes, args):
     # ===================== 多目标私有状态（线程安全）=====================
+
+    control_slice = suffix_manager.control_slice()
+    suffix_len = control_slice.stop - control_slice.start
+    current_target_index =  0
+    vocab_size = model.config.vocab_size
     batch_size = args.batch_size
+    guide_head = GradPolicyLSTM(suffix_len, vocab_size, args.top_k).to(device)
+    # 核心：自动跟随梯度输入的 dtype，彻底杜绝精度冲突
+    opt_guide = torch.optim.AdamW(guide_head.parameters(), lr=1e-4)
     not_allowed_tokens = None if allow_non_ascii else get_nonascii_toks(tokenizer)
     adv_suffix = adv_string_init
     log_dict = []
-    grad_matrix_log = []  # 新增：存每一步onehot梯度矩阵
+    grad_matrix_log = []
     pos_rank_log = []  # 专门存 (pos, rank) 批次记录
-    sample_method = "radom"
+    # best_cos_sim = -float('inf')
+    success_count = 0
+    early_stop_threshold = 5
 
+    ppl_suffix =  ""
+    mu = ""
+    con_loss = "contrast" if args.use_contrast_loss else ""
+    sample_method = "cnn"
+    global_best_suffix = ""
     submission_json_file = pathlib.Path(
-        f'{args.output_path}/submission/{args.loss_type}_{sample_method}_{args.id}.json')
+        f'{args.output_path}/submission/{mu}{args.loss_type}{ppl_suffix}_{sample_method}_{args.id}.json')
     log_json_file = pathlib.Path(
-        f'{args.output_path}/log/{args.loss_type}_{sample_method}_{args.id}.json')
+        f'{args.output_path}/log/{mu}_{con_loss}_{args.loss_type}_{ppl_suffix}_{sample_method}_{args.id}.json')
+    vis_states = pathlib.Path(
+        f'{args.output_path}/vis_states/{mu}_{con_loss}_{args.loss_type}_{ppl_suffix}_{sample_method}_{args.id}'
+    )
     grad_npy_file = pathlib.Path(f'{args.output_path}/grad/{args.loss_type}_{sample_method}_{args.id}_grad.npy')
     # ===================== 单独保存 pos_rank 日志 =====================
     pos_rank_file = pathlib.Path(f'{args.output_path}/pos_rank/{args.loss_type}_{sample_method}_{args.id}.npy')
     for f in [submission_json_file, log_json_file,pos_rank_file,grad_npy_file]:
         if not f.parent.exists():
             os.makedirs(f.parent, exist_ok=True)
-    global_best_suffix = ""
-    global_best_loss = inf
+    # 直接创建，不用判断 parent，更干净
+    vis_states.mkdir(parents=True, exist_ok=True)
+    for f in [submission_json_file, log_json_file]:
+        if not f.parent.exists():
+            os.makedirs(f.parent, exist_ok=True)
+    global_best_loss = float('inf')
+    guide_head.reset_hidden()
     for i in range(num_steps):
         attack_success = ""
         attack_gen_str = ""
-
         try:
             input_ids = suffix_manager.get_input_ids(adv_string=adv_suffix).to(device)
             control_slice = suffix_manager._control_slice
-            target_slice = suffix_manager._target_slice
-            coordinate_grad, attn_map ,target_str, pred_str = token_gradients(
+            target_slice  = suffix_manager._target_slice
+            coordinate_grad, attn_suffix_map ,target_str, pred_str = token_gradients(
                 model, input_ids,
                 control_slice,
                 target_slice,
                 suffix_manager._loss_slice,tokenizer
             )
+            # ======================== 正确 Warmup ========================
+            selected_pos, pos_prob, selected_token, token_prob = guide_head(coordinate_grad, attn_suffix_map, batch_size)
             grad_matrix_log.append(coordinate_grad.detach().cpu().numpy())
+
             with torch.no_grad():
                 top_k = args.top_k
                 adv_suffix_tokens = input_ids[control_slice].to(device)
                 # 🔥 传入位置权重（位置选择指导）
                 new_adv_suffix_toks, sel_pos_list, sel_tok_list, sel_rank_list  = sample_control(
                     adv_suffix_tokens, coordinate_grad,
-                    batch_size=batch_size, topk=top_k,
+                    selected_pos = selected_pos,  # 直接传
+                 #   selected_rank = selected_rank,  # 直接传
+                    batch_size=batch_size, topk= args.top_k,
                     not_allowed_tokens=not_allowed_tokens
                 )
-                #pos_count = dict(Counter(sel_pos_list))
-                #rank_count = dict(Counter(sel_rank_list))
 
                 # 新增：单独记录本批次全部 (位置, rank)
                 pos_rank_batch = list(zip(sel_pos_list, sel_rank_list))
                 pos_rank_log.append(pos_rank_batch)  # 只存纯数组，最小体积
                 unique_count = len(torch.unique(new_adv_suffix_toks, dim=0))
-                # pos_rank_pairs = list(zip(sel_pos_list, sel_rank_list))
-                #print(f"        生成了 {batch_size} 条，不重复数量：{unique_count}")
+                #print(f"生成了 {batch_size} 条，不重复数量：{unique_count}")
                 new_adv_suffix = get_filtered_cands(
                     tokenizer,
                     new_adv_suffix_toks,
@@ -311,13 +399,14 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
             best_ce_id = losses.argmin()
             ce_loss = losses[best_ce_id].item()
             best_new_adv_suffix = new_adv_suffix[best_ce_id]
-            # 用户每次替换
             adv_suffix = best_new_adv_suffix
 
             # 新增：记录当前最优被选中的位置 & topk 内排名
             best_sel_pos = sel_pos_list[best_ce_id]
             best_sel_rank = sel_rank_list[best_ce_id]
-            all_batch_ce_losses = losses.detach().cpu().mean().item()  # ✅ 整批平均 loss
+
+            all_batch_ce_losses= losses.detach().cpu().mean().item()  # ✅ 整批平均 loss
+
             train_is_success = not any([prefix in pred_str for prefix in test_prefixes])
             # ===================== 【关键修复】保存全局最优 =====================
             if ce_loss < global_best_loss:
@@ -325,55 +414,79 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
                 global_best_suffix = best_new_adv_suffix
             # =================
             # 日志
+            # ====================== 训练时直接用，不再重复 forward ======================
+            # ====================== ✅ 最终 100% 正确策略梯度 ======================
+            opt_guide.zero_grad()
+            # 1. 奖励（越小的loss → 越大的奖励）
+            reward = -losses.detach()  # shape [B]
+
+            pos_log_prob = torch.log(pos_prob[0, selected_pos] + 1e-8)  # [B]
+            #rk_log_prob = torch.log(rk_prob[0, selected_rank] + 1e-8)  # [B]
+            # 3. 联合动作概率（核心！必须相加）
+           # total_log_prob = pos_log_prob + rk_log_prob
+
+            # 改成：只学位置，rank 放弃学习
+            total_log_prob = pos_log_prob
+            # [B]
+            # 4. 策略梯度（唯一正确公式）
+            total_loss = -(total_log_prob * reward).mean()
+            # 反向传播
+            total_loss.backward()
+            opt_guide.step()
+            # 日志
             log_entry = {
                 "step": i,
                 "optimize_target": args.loss_type,
+                "behaviour": suffix_manager.instruction,  # 新增：对齐随机版
+                "target": suffix_manager.target,
                 "ce_loss": ce_loss,
                 "adv_suffix": adv_suffix,
-                "all_batch_ce_losses_mean": all_batch_ce_losses,  # ✅ 整批平均 loss
-                "top_k":top_k,
-                "batch_size":batch_size,
-                "behaviour": suffix_manager.instruction,
-                "target": suffix_manager.target,
+                "all_batch_ce_losses_mean": all_batch_ce_losses,
+                "top_k": top_k,
+                "batch_size": batch_size,  # 新增：对齐随机版
                 "train_gen_str": pred_str,
-                "train_is_success":train_is_success,
-               # "attack_success": attack_success,
-               # "attack_gen_str": attack_gen_str,
-                "global_best_loss":global_best_loss,
+                "train_is_success": train_is_success,
+                "global_best_loss": global_best_loss,
                 "global_best_suffix": global_best_suffix,
-                "simple_unique_count":unique_count,
+                "simple_unique_count": unique_count,
                 #"pos_count": pos_count,
-                "best_sel_pos": best_sel_pos,
                 #"rank_count": rank_count,
+                "best_sel_pos": best_sel_pos,
                 "best_sel_rank": best_sel_rank,
             }
             log_dict.append(log_entry)
-            print(f"id {args.id} | Step {i:2d} | ce_loss: {ce_loss}|" f"train_is_success:{train_is_success}")
+            print(f"id {args.id} | Step {i:2d} | LSTM Loss: {total_loss.item():.6f}| ce_loss: {ce_loss}")
+            #print("pos选的位置：", sorted(selected_pos.cpu().tolist()))
+            # print("rank选择：", sorted(selected_rank.cpu().tolist()))
         except Exception as e:
             trace_info = traceback.format_exc()
             print(f"\n❌ Step {i} 错误详情：\n{trace_info}")
             log_dict.append({"step": i, "err": str(e), "use_ppl_filter": args.use_ppl_filter})
             continue
-        del coordinate_grad, input_ids, logits, ids
-        gc.collect()
-        torch.cuda.empty_cache()
         if i % 10 == 0:
             with open(log_json_file, 'w', encoding='utf-8') as f:
                 json.dump(log_dict, f, ensure_ascii=False, indent=2)
+
+            ave_dict = {
+                "step": i,
+                "attn_suffix_map": attn_suffix_map.detach().cpu(),
+                "coordinate_grad": coordinate_grad.detach().cpu(),
+                "pos_prob": pos_prob.detach().cpu(),
+                "pos_head_w": guide_head.pos_head.weight.detach().cpu(),
+                "token_head_w": guide_head.token_head.weight.detach().cpu(),
+            }
+            # torch.save(save_dict, f"./vis_states/step_{i}.pth")
             np.save(pos_rank_file, np.array(pos_rank_log, dtype=object))
-            # np.save(grad_npy_file, np.array(grad_matrix_log, dtype=object))
-            # 直接堆叠成 3D 张量：[steps, control_len, vocab_size]
+            torch.save(ave_dict, vis_states / f"step_{i}.pth")
             grad_stack = np.stack(grad_matrix_log, axis=0)
             np.save(grad_npy_file, grad_stack)
+        del coordinate_grad, input_ids, logits, ids
+        gc.collect()
+        torch.cuda.empty_cache()
     with open(log_json_file, 'w', encoding='utf-8') as f:
         json.dump(log_dict, f, ensure_ascii=False, indent=2)
-    np.save(pos_rank_file, np.array(pos_rank_log, dtype=object))
-    # np.save(grad_npy_file, np.array(grad_matrix_log, dtype=object))
-    # 直接堆叠成 3D 张量：[steps, control_len, vocab_size]
-    grad_stack = np.stack(grad_matrix_log, axis=0)
-    np.save(grad_npy_file, grad_stack)
-    # ================================================================
     return log_dict
+
 
 # 固定所有随机种子（关键！）
 def set_seed(seed=42):
@@ -387,18 +500,21 @@ def set_seed(seed=42):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
     torch.use_deterministic_algorithms(True)
+
     # 3. 🔥 关键：单线程（消除多线程随机）
     torch.set_num_threads(1)
     torch.set_num_interop_threads(1)
+
     # 4. 🔥 关键：屏蔽 CUDA 非确定性算法
     os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
 
 
 class SuffixManager:
     """
-    管理 Prompt 构造与 Token 切片定位的核心类，用于精准划分 Prompt 中各功能区域的 Token 范围。
-    核心功能：构造包含指令、对抗后缀、目标输出的完整 Prompt，并定位各部分的 Token 切片。
-    """
+        管理 Prompt 构造与 Token 切片定位的核心类，用于精准划分 Prompt 中各功能区域的 Token 范围。
+        核心功能：构造包含指令、对抗后缀、目标输出的完整 Prompt，并定位各部分的 Token 切片。
+        """
+
     def __init__(self, *, tokenizer, conv_template, instruction, target, adv_string):
         """
         初始化 SuffixManager 实例。
@@ -597,17 +713,23 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="")
     parser.add_argument('--model_path', type=str, default=r"D:\Model\Llama-2-7b-chat-hf")
     parser.add_argument('--device', type=int, default=0)
+    #parser.add_argument('--id', type=int, default=1)
     parser.add_argument('--behaviors_config', type=str, default="./data/behaviors_config.json")
     parser.add_argument('--output_path', type=str,
                         default=f'./output/{datetime.datetime.now().strftime("%Y%m%d-%H%M%S")}')
     parser.add_argument('--batch_size', type=int, default=12)
     parser.add_argument('--top_k', type=int, default=256)
     parser.add_argument('--num_steps', type=int, default=500)
+    parser.add_argument('--early_stop', type=bool, default=False)
     parser.add_argument('--loss_type', type=str, default="cross_entropy", choices=["cross_entropy", "cosine", "contrast"])
     parser.add_argument('--use_ppl_filter', type=lambda x: x.lower() == 'true', default=False)
     parser.add_argument('--str_init',  type=str, default="! ! ! ! ! ! ! ! ! ! ! ! ! ! ! ! ! ! ! !")
-    parser.add_argument('--start_id', type=int, default=1)
-    parser.add_argument('--end_id', type=int, default=50)
+    parser.add_argument('--stick_steps', type=int, default=3)
+    parser.add_argument('--use_multi_target', type=lambda x: x.lower() == 'true', default=False)
+    parser.add_argument('--use_contrast_loss', type=lambda x: x.lower() == 'true', default=False)
+    parser.add_argument('--start_id', type=int, default=1)  # 新增
+    parser.add_argument('--end_id', type=int, default=50)  # 新增
+    parser.add_argument('--warmup_steps', type=int, default=50)
     args = parser.parse_args()
     set_seed(42)
     device = f"cuda:{args.device}" if torch.cuda.is_available() else "cpu"
@@ -618,33 +740,16 @@ if __name__ == '__main__':
                                                 attn_implementation="eager",
                                                 device=device)
     conv_template = load_conversation_template(template_name)
-    # ========== 循环运行多个样本 ==========
     model_name = os.path.basename(args.model_path)
     # 🔥 拼接你要的输出路径（完全不写死）
-    output_path = os.path.join(f"{model_name}_result",f'Radom_{datetime.datetime.now().strftime("%Y%m%d-%H%M%S")}')
-    args.output_path =output_path
-    print("🚀 Experiment Arguments")
-    print("=" * 50)
-    arg_items = [
-        ("Device", f"cuda:{args.device}"),
-        ("Start_ID", args.start_id),
-        ("End_ID", args.end_id),
-        ("Behaviors Config", args.behaviors_config),
-        ("Output Path", args.output_path),
-        ("Batch Size", args.batch_size),
-        ("Top K", args.top_k),
-        ("Num Steps", args.num_steps),
-        ("Loss Type", args.loss_type),
-        ("Git Commit", GIT_COMMIT),  # <-- 在这里加上了
-    ]
-    for k, v in arg_items:
-        print(f"{k:<22} : {v}")
-    print("=" * 50)
-
+    output_path = os.path.join(f"{model_name}_result", f'LSTM_{datetime.datetime.now().strftime("%Y%m%d-%H%M%S")}')
+    args.output_path = output_path
     for data_id in range(args.start_id, args.end_id + 1):
+        args.id = data_id
         try:
-            args.id = data_id
-            behavior_config = yaml.load(open(args.behaviors_config, 'r', encoding='utf-8'), Loader=yaml.FullLoader)[data_id - 1]
+            # 加载配置
+            behavior_config = yaml.load(open(args.behaviors_config, 'r', encoding='utf-8'), Loader=yaml.FullLoader)[
+                data_id - 1]
             user_prompt = behavior_config["behaviour"]
             target = behavior_config["target"]
             adv_string_init = args.str_init
@@ -656,18 +761,28 @@ if __name__ == '__main__':
                 adv_string=adv_string_init
             )
             suffix_manager.get_prompt(adv_string=adv_string_init)
-
+            # =============================================================================
+            # 🔥 加在这里：初始化引导头
+            # =============================================================================
+            print(f"\n启动对比实验 | 优化目标: {args.loss_type} | PPL Filter: {args.use_ppl_filter}| INIT: {adv_string_init} | use_multi_target: {args.use_multi_target}\n")
+            print("               🚀 Experiment Arguments")
             print("=" * 50)
             arg_items = [
+                ("Model Path", args.model_path),
                 ("Device", f"cuda:{args.device}"),
-                ("ID", data_id),
+                ("ID_start", args.start_id),
+                ("ID_end",   args.end_id),
+                ("ID", args.id),
                 ("Behaviors Config", args.behaviors_config),
                 ("Output Path", args.output_path),
                 ("Batch Size", args.batch_size),
                 ("Top K", args.top_k),
                 ("Num Steps", args.num_steps),
+                ("Early Stop", args.early_stop),
                 ("Loss Type", args.loss_type),
+                ("Use PPL Filter", args.use_ppl_filter),
                 ("Init Suffix", adv_string_init),
+             #   ("Stick Steps", args.stick_steps),
             ]
             for k, v in arg_items:
                 print(f"{k:<22} : {v}")
@@ -678,9 +793,12 @@ if __name__ == '__main__':
                 adv_string_init=adv_string_init, num_steps=args.num_steps,
                 device=device, test_prefixes=test_prefixes, args=args
             )
+            gc.collect()
+            # ✅ 修复：正确计算耗时
             cost_time = time.time() - start
             print(f"\n✅ 样本 {args.id} 实验完成，耗时 {cost_time:.2f} 秒！日志已保存，{args} ")
         except Exception as e:
             print(f"ID {args.id} 失败，跳过：{e}")
-            continue
         gc.collect()
+        # ✅ 修复：正确计算耗时
+    del model, tokenizer

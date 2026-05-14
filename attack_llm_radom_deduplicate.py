@@ -27,12 +27,12 @@ if not repo_root:
     repo_root = os.path.dirname(experiments_dir)
 sys.path.append(os.path.abspath(repo_root))
 
-from llm_attacks.minimal_gcg.opt_utils import ( get_logits, generate,
-    load_model_and_tokenizer, get_filtered_cands,get_embedding_matrix,get_embeddings
-)
+from llm_attacks.minimal_gcg.opt_utils import get_logits, generate,load_model_and_tokenizer, get_filtered_cands,get_embedding_matrix,get_embeddings
 from llm_attacks.minimal_gcg.string_utils import load_conversation_template
 from llm_attacks import get_nonascii_toks
 import subprocess
+
+suffix_list = []
 # ===================== 获取 Git 版本号 =====================
 def get_git_version(file_path=__file__):
     try:
@@ -151,19 +151,43 @@ def check_for_attack_success(model, tokenizer, suffix_manager, suffix: str, test
     jail_broken = not any(p in gen_str for p in test_prefixes)
     return jail_broken, gen_str
 
+# def sample_control(control_toks, grad, batch_size ,topk=256, temp=1.0, not_allowed_tokens=None):
+#     if not_allowed_tokens is not None:
+#         grad[:, not_allowed_tokens.to(grad.device)] = np.inf
+#     top_indices = (-grad).topk(topk, dim=1).indices
+#     control_toks = control_toks.to(grad.device)
+#     original_control_toks = control_toks.repeat(batch_size, 1)
+#     # new_token_pos = torch.arange(
+#     #     0,
+#     #     len(control_toks),
+#     #     len(control_toks) / batch_size,
+#     #     device=grad.device
+#     # ).type(torch.int64)
+#     #print(new_token_pos, selected_pos)
+#     new_token_pos = torch.randint(
+#         low=0,
+#         high=len(control_toks),
+#         size=(batch_size,),
+#         device=grad.device
+#     )
+#     rand_idx = torch.randint(0, topk, (batch_size, 1), device=grad.device)
+#     selected_rank = rand_idx.squeeze(1).cpu().tolist()  # ✅ 正确获取排名
+#     new_token_val = torch.gather(
+#         top_indices[new_token_pos], 1,
+#         rand_idx
+#     )
+#     new_control_toks = original_control_toks.scatter_(1, new_token_pos.unsqueeze(-1), new_token_val)
+#
+#     return new_control_toks, new_token_pos.cpu().tolist(), new_token_val.cpu().tolist(), selected_rank
+
+
 def sample_control(control_toks, grad, batch_size ,topk=256, temp=1.0, not_allowed_tokens=None):
     if not_allowed_tokens is not None:
         grad[:, not_allowed_tokens.to(grad.device)] = np.inf
     top_indices = (-grad).topk(topk, dim=1).indices
     control_toks = control_toks.to(grad.device)
     original_control_toks = control_toks.repeat(batch_size, 1)
-    # new_token_pos = torch.arange(
-    #     0,
-    #     len(control_toks),
-    #     len(control_toks) / batch_size,
-    #     device=grad.device
-    # ).type(torch.int64)
-    #print(new_token_pos, selected_pos)
+
     new_token_pos = torch.randint(
         low=0,
         high=len(control_toks),
@@ -171,12 +195,63 @@ def sample_control(control_toks, grad, batch_size ,topk=256, temp=1.0, not_allow
         device=grad.device
     )
     rand_idx = torch.randint(0, topk, (batch_size, 1), device=grad.device)
-    selected_rank = rand_idx.squeeze(1).cpu().tolist()  # ✅ 正确获取排名
-    new_token_val = torch.gather(
-        top_indices[new_token_pos], 1,
-        rand_idx
-    )
+
+    # ===================== 去重：生成时就确保不重复 =====================
+    new_token_val_list = []
+    selected_rank_list = []
+    generated_batch_suffixes = []
+
+    for i in range(batch_size):
+        pos = new_token_pos[i].item()
+        start_rank = rand_idx[i].item()
+
+        chosen_val = None
+        chosen_rank = start_rank
+
+        # 从 start_rank 向前找，直到 0
+        for r in range(start_rank, -1, -1):
+            val = top_indices[pos, r]
+            tmp = original_control_toks[i].clone()
+            tmp[pos] = val
+            suffix = tokenizer.decode(tmp, skip_special_tokens=True).strip()
+
+            if suffix not in suffix_list:
+                chosen_val = val
+                chosen_rank = r
+                break
+
+        # 兜底：从 0 ~ topk 再扫一遍确保一定找到
+        if chosen_val is None:
+            for r in range(0, topk):
+                val = top_indices[pos, r]
+                tmp = original_control_toks[i].clone()
+                tmp[pos] = val
+                suffix = tokenizer.decode(tmp, skip_special_tokens=True).strip()
+                if suffix not in suffix_list:
+                    chosen_val = val
+                    chosen_rank = r
+                    break
+
+        # 最终选中
+        tmp_final = original_control_toks[i].clone()
+        tmp_final[pos] = chosen_val
+        final_suffix = tokenizer.decode(tmp_final, skip_special_tokens=True).strip()
+
+        new_token_val_list.append(chosen_val)
+        selected_rank_list.append(chosen_rank)
+        generated_batch_suffixes.append(final_suffix)
+
+    # 把这一整批生成的所有新后缀 全部记录！！！
+    for s in generated_batch_suffixes:
+        if s not in suffix_list:
+            suffix_list.append(s)
+
+    new_token_val = torch.tensor(new_token_val_list, device=grad.device).unsqueeze(1)
+    selected_rank = selected_rank_list
+    # ====================================================================
+
     new_control_toks = original_control_toks.scatter_(1, new_token_pos.unsqueeze(-1), new_token_val)
+
     return new_control_toks, new_token_pos.cpu().tolist(), new_token_val.cpu().tolist(), selected_rank
 
 # 核心：适配所有主流LLM的嵌入层获取逻辑
@@ -240,11 +315,10 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
     grad_matrix_log = []  # 新增：存每一步onehot梯度矩阵
     pos_rank_log = []  # 专门存 (pos, rank) 批次记录
     sample_method = "radom"
-
     submission_json_file = pathlib.Path(
         f'{args.output_path}/submission/{args.loss_type}_{sample_method}_{args.id}.json')
     log_json_file = pathlib.Path(
-        f'{args.output_path}/log/{args.loss_type}_{sample_method}_{args.id}.json')
+        f'{args.output_path}/log/{args.loss_type}_{sample_method}_deduplicate_{args.id}.json')
     grad_npy_file = pathlib.Path(f'{args.output_path}/grad/{args.loss_type}_{sample_method}_{args.id}_grad.npy')
     # ===================== 单独保存 pos_rank 日志 =====================
     pos_rank_file = pathlib.Path(f'{args.output_path}/pos_rank/{args.loss_type}_{sample_method}_{args.id}.npy')
@@ -256,7 +330,6 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
     for i in range(num_steps):
         attack_success = ""
         attack_gen_str = ""
-
         try:
             input_ids = suffix_manager.get_input_ids(adv_string=adv_suffix).to(device)
             control_slice = suffix_manager._control_slice
@@ -279,7 +352,6 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
                 )
                 #pos_count = dict(Counter(sel_pos_list))
                 #rank_count = dict(Counter(sel_rank_list))
-
                 # 新增：单独记录本批次全部 (位置, rank)
                 pos_rank_batch = list(zip(sel_pos_list, sel_rank_list))
                 pos_rank_log.append(pos_rank_batch)  # 只存纯数组，最小体积
@@ -346,6 +418,7 @@ def minimal_gcg_attack(model, tokenizer, suffix_manager, adv_string_init, num_st
                 "best_sel_pos": best_sel_pos,
                 #"rank_count": rank_count,
                 "best_sel_rank": best_sel_rank,
+                "suffix_list_len":len(suffix_list)
             }
             log_dict.append(log_entry)
             print(f"id {args.id} | Step {i:2d} | ce_loss: {ce_loss}|" f"train_is_success:{train_is_success}")
